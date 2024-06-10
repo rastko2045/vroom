@@ -9,6 +9,8 @@ mod nvme;
 mod pci;
 #[allow(dead_code)]
 mod queues;
+#[allow(dead_code)]
+mod zns;
 
 pub use memory::HUGE_PAGE_SIZE;
 pub use nvme::{NvmeDevice, NvmeQueuePair};
@@ -32,12 +34,6 @@ pub fn init(pci_addr: &str) -> Result<NvmeDevice, Box<dyn Error>> {
     }
 
     let mut nvme = NvmeDevice::init(pci_addr)?;
-    nvme.identify_controller()?;
-    let ns = nvme.identify_namespace_list(0);
-    for n in ns {
-        println!("ns_id: {n}");
-        nvme.identify_namespace(n);
-    }
     Ok(nvme)
 }
 
@@ -46,6 +42,10 @@ pub struct NvmeNamespace {
     pub id: u32,
     pub blocks: u64,
     pub block_size: u64,
+    pub zns : bool
+    //TODO a csi variable must be added
+    //an optional zns struct that will save some information on the zns parts, most importantly 
+    //zone size, number of zones
 }
 
 #[derive(Debug, Clone, Default)]

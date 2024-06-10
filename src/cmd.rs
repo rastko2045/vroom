@@ -147,6 +147,24 @@ impl NvmeCommand {
         }
     }
 
+    pub fn identify_zns_namespace_list(c_id: u16, ptr: usize, base: u32) -> Self {
+        Self {
+            opcode: 6,
+            flags: 0,
+            c_id,
+            ns_id: base,
+            _rsvd: 0,
+            md_ptr: 0,
+            d_ptr: [ptr as u64, 0],
+            cdw10: 7,
+            cdw11: (2 << 24),
+            cdw12: 0,
+            cdw13: 0,
+            cdw14: 0,
+            cdw15: 0,
+        }
+    }
+
     pub fn get_features(c_id: u16, ptr: usize, fid: u8) -> Self {
         Self {
             opcode: 0xA,
@@ -259,6 +277,41 @@ impl NvmeCommand {
             cdw14: 0,
             cdw15: 0,
         }
+    }
 
+    pub fn zone_management_send(c_id: u16, ns_id: u32, slba: u64, select_all: bool, zsa: u8, ptr0 : u64, ptr1 : u64) -> Self {
+        Self {
+            opcode: 0x79,
+            flags: 0, //TODO
+            c_id,
+            ns_id,
+            _rsvd: 0,
+            md_ptr: 0,
+            d_ptr: [ptr0, ptr1], //TODO
+            cdw10: slba as u32,
+            cdw11: (slba >> 32) as u32,
+            cdw12: 0,
+            cdw13: ((select_all as u32) << 8) | zsa as u32,
+            cdw14: 0,
+            cdw15: 0
+        }
+    }
+
+    pub fn zone_management_rcv(c_id: u16, ns_id: u32, slba: u64, n_dwords: u32, zra: u8, zra_field: u8, zra_spec_feats: bool, ptr0 : u64, ptr1 : u64) -> Self {
+        Self {
+            opcode: 0x7A,
+            flags: 0,
+            c_id,
+            ns_id,
+            _rsvd: 0,
+            md_ptr: 0,
+            d_ptr: [ptr0, ptr1], //TODO
+            cdw10: slba as u32,
+            cdw11: (slba >> 32) as u32,
+            cdw12: n_dwords,
+            cdw13: ((zra_spec_feats as u32) << 16) | ((zra_field as u32) << 8) | zra as u32,
+            cdw14: 0,
+            cdw15: 0
+        }
     }
 }

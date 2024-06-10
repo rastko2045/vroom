@@ -321,6 +321,23 @@ impl NvmeDevice {
         })?;
         dev.q_id += 1;
 
+        dev.identify_controller()?;
+        let ns = dev.identify_namespace_list(0);
+        
+        for n in ns {
+            println!("ns_id: {n}");
+            dev.identify_namespace(n);
+        }
+        //TODO if ZNS are supported call identify namespace and store zone data? IdentifyNamespaceZNSData
+        // See step 8 page 125, you'll find the answer through identify (CNS 1Ch) and figure 290
+        if(dev.get_reg64(NvmeRegs64::CAP as u64) & 0x2F != 0) {
+            let zns_ns = dev.identify_zns_namespace_list(0);
+            for n in zns_ns {
+                println!("ns_id: {n} supports zns");
+                dev.namespaces.get_mut(&n).unwrap().zns = true;
+            }
+        }
+
         Ok(dev)
     }
 
@@ -375,7 +392,7 @@ impl NvmeDevice {
 
         let dbl = self.addr as usize + offset;
 
-        let comp_queue = NvmeCompQueue::new(len, dbl)?;
+        let comp_queue: NvmeCompQueue = NvmeCompQueue::new(len, dbl)?;
         let comp = self.submit_and_complete_admin(|c_id, _| {
             NvmeCommand::create_io_completion_queue(
                 c_id,
@@ -431,6 +448,20 @@ impl NvmeDevice {
             .collect::<Vec<u32>>()
     }
 
+    pub fn identify_zns_namespace_list(&mut self, base: u32) -> Vec<u32> {
+        self.submit_and_complete_admin(|c_id, addr| {
+            NvmeCommand::identify_zns_namespace_list(c_id, addr, base)
+        });
+
+        let data: &[u32] =
+            unsafe { std::slice::from_raw_parts(self.buffer.virt as *const u32, 1024) };
+
+        data.iter()
+            .copied()
+            .take_while(|&id| id != 0)
+            .collect::<Vec<u32>>()
+    }
+
     pub fn identify_namespace(&mut self, id: u32) -> NvmeNamespace {
         self.submit_and_complete_admin(|c_id, addr| {
             NvmeCommand::identify_namespace(c_id, addr, id)
@@ -459,6 +490,7 @@ impl NvmeDevice {
             id,
             blocks,
             block_size,
+            zns : false
         };
         self.namespaces.insert(id, namespace);
         namespace
@@ -525,15 +557,7 @@ impl NvmeDevice {
         let q_id = 1;
 
         let bytes = blocks * ns.block_size;
-        let ptr1 = if bytes <= 4096 {
-            0
-        } else if bytes <= 8192 {
-            addr + 4096 // self.page_size
-        } else {
-            // idk if this works
-            let offset = (addr - self.buffer.phys as u64) / 8;
-            self.prp_list.phys as u64 + offset
-        };
+        let ptr1 = self.get_prp2(bytes);
 
         let entry = if write {
             NvmeCommand::io_write(
@@ -672,14 +696,7 @@ impl NvmeDevice {
         let q_id = 1;
 
         let bytes = blocks * 512;
-        let ptr1 = if bytes <= 4096 {
-            0
-        } else if bytes <= 8192 {
-            // self.buffer.phys as u64 + 4096 // self.page_size
-            addr + 4096 // self.page_size
-        } else {
-            self.prp_list.phys as u64
-        };
+        let ptr1 = self.get_prp2(bytes);
 
         let entry = if write {
             NvmeCommand::io_write(
@@ -740,6 +757,83 @@ impl NvmeDevice {
             0xFFFF_FFFF
         };
         self.submit_and_complete_admin(|c_id, _| NvmeCommand::format_nvm(c_id, ns_id));
+    }
+
+    //pub fn zns_ns_get_zone_size();
+    //pub fn zns_ns_get_num_zones();
+
+    //close/open/finish/reset/offline zone
+
+
+    pub fn zns_zone_mgmt_rcv(
+		&mut self,
+		ns_id: u32,
+		slba: u64,
+		n_dwords: u32,
+		zra: u8, 
+		zra_field: u8, 
+		zra_spec_feats: bool
+	) -> Result<(), Box<dyn Error>> {
+        let bytes = n_dwords * 4;
+        let ptr0 = self.buffer.phys as u64;
+        let ptr1 = self.get_prp2(bytes as u64);
+		let entry = NvmeCommand::zone_management_rcv(
+            self.io_sq.tail as u16, 
+            ns_id, 
+            slba, 
+            n_dwords, 
+            zra, 
+            zra_field, 
+            zra_spec_feats,
+            ptr0,
+            ptr1);
+		let tail = self.io_sq.submit(entry);
+        self.stats.submissions += 1;
+		self.write_reg_idx(NvmeArrayRegs::SQyTDBL, self.q_id as u16, tail as u32);
+		self.io_sq.head = self.complete_io(1).unwrap() as usize;
+        Ok(())
+	}
+
+    pub fn zns_zone_mgmt_send(
+		&mut self,
+		ns_id: u32,
+		slba: u64,
+		n_dwords: u32,
+		zra: u8, 
+		zra_field: u8, 
+		zra_spec_feats: bool
+	) -> Result<(), Box<dyn Error>> {
+        let bytes = n_dwords * 4;
+        let ptr0 = self.buffer.phys as u64;
+        let ptr1 = self.get_prp2(bytes as u64);
+		let entry = NvmeCommand::zone_management_rcv(
+            self.io_sq.tail as u16, 
+            ns_id, 
+            slba, 
+            n_dwords, 
+            zra, 
+            zra_field, 
+            zra_spec_feats,
+            ptr0,
+            ptr1);
+		let tail = self.io_sq.submit(entry);
+        self.stats.submissions += 1;
+		self.write_reg_idx(NvmeArrayRegs::SQyTDBL, self.q_id as u16, tail as u32);
+		self.io_sq.head = self.complete_io(1).unwrap() as usize;
+        Ok(())
+	}
+
+
+
+    /// Gets PRP2 value depending on the size of the data to be transferred
+    fn get_prp2(&self, bytes : u64) -> u64 {
+        if bytes <= 4096 {
+            0
+        } else if bytes <= 8192 {
+            self.buffer.phys as u64 + 4096 // self.page_size
+        } else {
+            self.prp_list.phys as u64
+        }
     }
 
     /// Sets Queue `qid` Tail Doorbell to `val`
