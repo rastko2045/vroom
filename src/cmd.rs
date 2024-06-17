@@ -111,6 +111,24 @@ impl NvmeCommand {
         }
     }
 
+    pub fn identify_namespace_zns(c_id: u16, ptr: usize, ns_id: u32) -> Self {
+        Self {
+            opcode: 6,
+            flags: 0,
+            c_id,
+            ns_id,
+            _rsvd: 0,
+            md_ptr: 0,
+            d_ptr: [ptr as u64, 0],
+            cdw10: 5,
+            cdw11: (2 << 24),
+            cdw12: 0,
+            cdw13: 0,
+            cdw14: 0,
+            cdw15: 0,
+        }
+    }
+
     pub fn identify_controller(c_id: u16, ptr: usize) -> Self {
         Self {
             opcode: 6,

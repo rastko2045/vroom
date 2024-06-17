@@ -2,7 +2,8 @@ use crate::cmd::NvmeCommand;
 use crate::memory::{Dma, DmaSlice};
 use crate::pci::pci_map_resource;
 use crate::queues::*;
-use crate::{NvmeNamespace, NvmeStats, HUGE_PAGE_SIZE};
+use crate::zns::IdentifyNamespaceZNSData;
+use crate::{NvmeNamespace, NvmeZNSInfo, NvmeStats, HUGE_PAGE_SIZE};
 use std::collections::HashMap;
 use std::error::Error;
 use std::hint::spin_loop;
@@ -334,7 +335,7 @@ impl NvmeDevice {
             let zns_ns = dev.identify_zns_namespace_list(0);
             for n in zns_ns {
                 println!("ns_id: {n} supports zns");
-                dev.namespaces.get_mut(&n).unwrap().zns = true;
+                dev.identify_zns_namespace(n)
             }
         }
 
@@ -475,8 +476,10 @@ impl NvmeDevice {
         let blocks = namespace_data.ncap;
 
         // figure out block size
-        let flba_idx = (namespace_data.flbas & 0xF) as usize;
-        let flba_data = (namespace_data.lba_format_support[flba_idx] >> 16) & 0xFF;
+        //TODO this is actually making a big assumption, added assert to check
+        let flba_idx = (namespace_data.flbas & 0xF); 
+        assert!(namespace_data.nlbaf == 16); 
+        let flba_data = (namespace_data.lba_format_support[flba_idx as usize] >> 16) & 0xFF;
         let block_size = if !(9..32).contains(&flba_data) {
             0
         } else {
@@ -490,10 +493,31 @@ impl NvmeDevice {
             id,
             blocks,
             block_size,
-            zns : false
+            flba_idx,
+            zns_info : None
         };
         self.namespaces.insert(id, namespace);
         namespace
+    }
+
+    pub fn identify_zns_namespace(&mut self, id : u32) {
+        self.submit_and_complete_admin(|c_id, addr| {
+            NvmeCommand::identify_namespace_zns(c_id, addr, id)
+        });
+        
+        let zns_data : IdentifyNamespaceZNSData =
+            unsafe { *(self.buffer.virt as *const IdentifyNamespaceZNSData) };
+
+        let ns = self.namespaces.get(&id).unwrap();
+        let zone_size = (zns_data.lbafe[ns.flba_idx as usize] & 0xFFFF_FFFF) as u64;
+        let n_zones = ns.blocks / zone_size;
+        println!("Namespace {id}, Zone Size: {zone_size}, Number of Zones: {n_zones}");
+
+        let zns_info = NvmeZNSInfo {
+            zone_size,
+            n_zones
+        };
+        self.namespaces.get_mut(&id).unwrap().zns_info = Some(zns_info);
     }
 
     // TODO: currently namespace 1 is hardcoded
@@ -764,6 +788,16 @@ impl NvmeDevice {
 
     //close/open/finish/reset/offline zone
 
+    // ZNS specific commands
+
+    pub fn zns_zone_report(
+		&mut self,
+		ns_id: u32,
+		slba: u64,
+		n_dwords: u32,
+	) -> Result<(), Box<dyn Error>> {
+        return self.zns_zone_mgmt_rcv(ns_id, slba, n_dwords, 0, 0, true);
+    }
 
     pub fn zns_zone_mgmt_rcv(
 		&mut self,
@@ -822,8 +856,6 @@ impl NvmeDevice {
 		self.io_sq.head = self.complete_io(1).unwrap() as usize;
         Ok(())
 	}
-
-
 
     /// Gets PRP2 value depending on the size of the data to be transferred
     fn get_prp2(&self, bytes : u64) -> u64 {

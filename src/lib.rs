@@ -33,7 +33,7 @@ pub fn init(pci_addr: &str) -> Result<NvmeDevice, Box<dyn Error>> {
         return Err(format!("device {} is not a block device", pci_addr).into());
     }
 
-    let mut nvme = NvmeDevice::init(pci_addr)?;
+    let nvme = NvmeDevice::init(pci_addr)?;
     Ok(nvme)
 }
 
@@ -42,8 +42,16 @@ pub struct NvmeNamespace {
     pub id: u32,
     pub blocks: u64,
     pub block_size: u64,
-    pub zns : bool
-    //TODO a csi variable must be added
+    pub flba_idx: u8, //LBA Format index
+    pub zns_info : Option<NvmeZNSInfo>
+    //an optional zns struct that will save some information on the zns parts, most importantly 
+    //zone size, number of zones
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NvmeZNSInfo {
+    pub zone_size: u64, //in number of blocks
+    pub n_zones: u64
     //an optional zns struct that will save some information on the zns parts, most importantly 
     //zone size, number of zones
 }
