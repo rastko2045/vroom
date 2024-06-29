@@ -2,7 +2,7 @@ use crate::cmd::NvmeCommand;
 use crate::memory::{Dma, DmaSlice};
 use crate::pci::pci_map_resource;
 use crate::queues::*;
-use crate::zns::IdentifyNamespaceZNSData;
+use crate::zns::*;
 use crate::{NvmeNamespace, NvmeZNSInfo, NvmeStats, HUGE_PAGE_SIZE};
 use std::collections::HashMap;
 use std::error::Error;
@@ -478,7 +478,7 @@ impl NvmeDevice {
         // figure out block size
         //TODO this is actually making a big assumption, added assert to check
         let flba_idx = (namespace_data.flbas & 0xF); 
-        assert!(namespace_data.nlbaf == 16); 
+        assert!(namespace_data.nlbaf <= 16); 
         let flba_data = (namespace_data.lba_format_support[flba_idx as usize] >> 16) & 0xFF;
         let block_size = if !(9..32).contains(&flba_data) {
             0
@@ -790,13 +790,46 @@ impl NvmeDevice {
 
     // ZNS specific commands
 
-    pub fn zns_zone_report(
-		&mut self,
-		ns_id: u32,
-		slba: u64,
-		n_dwords: u32,
-	) -> Result<(), Box<dyn Error>> {
-        return self.zns_zone_mgmt_rcv(ns_id, slba, n_dwords, 0, 0, true);
+
+    // Zone Report Data Structure
+    // See Section 3.4.2.2.1 and Figure 35 of the ZNS NVME Specification
+    fn get_zone_reports(
+        &mut self, 
+        ns_id : u32, 
+        slba : u64, 
+        n_dwords : u32,
+    ) -> Result<(), Box<dyn Error>> {
+      return self.zns_zone_mgmt_rcv(ns_id, slba, n_dwords, 0, 0, true);
+    }
+
+    pub fn get_zone_descriptors(
+        &mut self,
+        ns_id : u32,
+    ) -> Result<(), Box<dyn Error>> {
+        let zones = self.namespaces.get(&ns_id).unwrap().zns_info.unwrap().n_zones;
+        let n_dwords = 1 + (zones * 64) / 4;
+        self.get_zone_reports(ns_id, 0, n_dwords as u32);
+        let n_zones = unsafe { *(self.buffer.virt as *const u64) };
+        for i in 0..n_zones {
+            let offset = (i + 1) * 64;
+            let data = unsafe { *(self.buffer.virt.add(offset as usize) as *const ZoneDescriptorData)};
+            print!("Zone type for zone {} is {}", i, data.zt);
+        }
+        Ok(())
+    }
+
+    fn get_zone_descriptor(
+        &mut self, 
+        ns_id : u32, 
+        slba : u64, 
+        n_dwords : u32,
+        n : usize
+    ) -> Result<(), Box<dyn Error>> {
+      self.zns_zone_mgmt_rcv(ns_id, slba, n_dwords, 0, 0, true);
+      let n_zones = unsafe { *(self.buffer.virt as *const u64) };
+      let offset = (n + 1) * 64;
+      let data = unsafe { *(self.buffer.virt.add(offset) as *const ZoneDescriptorData)};
+      Ok(())
     }
 
     pub fn zns_zone_mgmt_rcv(

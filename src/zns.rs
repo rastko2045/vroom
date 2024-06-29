@@ -1,5 +1,3 @@
-use std::vec;
-
 // Identify Namespace Data Structure for the ZNS Command Set
 // See section 4.1.5.1 and Figure 48 of the ZNS NVME specification.
 #[repr(C, packed)]
@@ -23,31 +21,19 @@ pub struct IdentifyNamespaceZNSData {
 	vendor_specific : [u8; 256]
 }
 
-// Zone Report Data Structure
-// See Section 3.4.2.2.1 and Figure 35 of the ZNS NVME Specification
-#[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
-#[allow(unused)]
-pub struct ZoneReportData {
-	n_zones : u64,			// number of zones
-	_reserved : [u8; 56],	// reserved
-	zd : [ZoneDescriptorData; 0] // zone descriptor TODO ?? un vecteur, non?
-}
-
-
 // Zone Descriptor Data Structure
 // See Section 3.4.2.2.3 and Figure 37 of the ZNS NVME Specification
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 #[allow(unused)]
 pub struct ZoneDescriptorData {
-    zt : u8,            // zone type
-    zs : u8,            // zone state 
+    pub zt : u8,            // zone type
+    pub zs : u8,            // zone state 
     za : u8,            // zone attributes 
     zai : u8,           // zone attributes information 
     _rsvd1 : u32,       // reserved
     zcap : u64,         // zone capacity
     zslba : u64,        // zone start logical block address 
-    wp : u64,           // write pointer 
+    pub wp : u64,           // write pointer 
     _rsvd2 : [u8; 32]   // reserved 
 }
