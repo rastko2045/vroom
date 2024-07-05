@@ -27,13 +27,13 @@ pub struct IdentifyNamespaceZNSData {
 #[derive(Debug, Clone, Copy)]
 #[allow(unused)]
 pub struct ZoneDescriptorData {
-    pub zt : u8,            // zone type
-    pub zs : u8,            // zone state 
-    za : u8,            // zone attributes 
+    pub zt : u8,        // zone type
+    pub zs : u8,        // zone state 
+    pub za : u8,        // zone attributes 
     zai : u8,           // zone attributes information 
     _rsvd1 : u32,       // reserved
-    zcap : u64,         // zone capacity
-    zslba : u64,        // zone start logical block address 
-    pub wp : u64,           // write pointer 
+    pub zcap : u64,     // zone capacity
+    pub zslba : u64,    // zone start logical block address 
+    pub wp : u64,       // write pointer 
     _rsvd2 : [u8; 32]   // reserved 
 }

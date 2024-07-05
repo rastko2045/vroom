@@ -282,6 +282,15 @@ impl NvmeDevice {
         // Set Completion (2^4 = 16 Bytes) and Submission Entry (2^6 = 64 Bytes) sizes
         cc |= (4 << 20) | (6 << 16);
 
+        // This is normally sane, but QEMU nvme might be bugged? Both bits 6 and 7 of CAP.CSS are set?? 
+        // Step 3 of controller initialization, setting CC.CSS according to CAP.CSS
+        // if((dev.get_reg64(NvmeRegs64::CAP as u64) >> 37) & 0x80 != 0) {
+        //     cc |= (7 << 4); // 111b
+        // }
+        if((dev.get_reg64(NvmeRegs64::CAP as u64) >> 37) & 0x40 != 0) {
+            cc |= (6 << 4); // 110b
+        }
+
         // Set Memory Page Size
         // let mpsmax = ((dev.get_reg64(NvmeRegs64::CAP as u64) >> 52) & 0xF) as u32;
         // cc |= (mpsmax << 7);
@@ -331,12 +340,15 @@ impl NvmeDevice {
         }
         //TODO if ZNS are supported call identify namespace and store zone data? IdentifyNamespaceZNSData
         // See step 8 page 125, you'll find the answer through identify (CNS 1Ch) and figure 290
-        if(dev.get_reg64(NvmeRegs64::CAP as u64) & 0x2F != 0) {
+        if((dev.get_reg64(NvmeRegs64::CAP as u64) >> 37) & 0x40 != 0) {
             let zns_ns = dev.identify_zns_namespace_list(0);
             for n in zns_ns {
                 println!("ns_id: {n} supports zns");
                 dev.identify_zns_namespace(n)
             }
+        }
+        else {
+            println!("ZNS is not supported!")
         }
 
         Ok(dev)
@@ -790,6 +802,7 @@ impl NvmeDevice {
 
     // ZNS specific commands
 
+    //TODO Clear zone
 
     // Zone Report Data Structure
     // See Section 3.4.2.2.1 and Figure 35 of the ZNS NVME Specification
@@ -807,13 +820,18 @@ impl NvmeDevice {
         ns_id : u32,
     ) -> Result<(), Box<dyn Error>> {
         let zones = self.namespaces.get(&ns_id).unwrap().zns_info.unwrap().n_zones;
-        let n_dwords = 1 + (zones * 64) / 4;
+        let n_dwords = (zones + 1) * 16; //64 bytes per zone descriptor structure
         self.get_zone_reports(ns_id, 0, n_dwords as u32);
-        let n_zones = unsafe { *(self.buffer.virt as *const u64) };
-        for i in 0..n_zones {
+        let nr_zones = unsafe { *(self.buffer.virt as *const u64) };
+        println!("nr_zones: {}", nr_zones);
+        for i in 0..nr_zones {
             let offset = (i + 1) * 64;
             let data = unsafe { *(self.buffer.virt.add(offset as usize) as *const ZoneDescriptorData)};
-            print!("Zone type for zone {} is {}", i, data.zt);
+            let zslba = data.zslba;
+            let wp = data.wp;
+            let zcap = data.zcap;
+            println!("SLBA: 0x{:x}  WP: 0x{:x}  Cap: 0x{:x}   State: {}   Type: {}    Attrs:  0x{:x}", 
+                    zslba, wp, zcap, data.zs, data.zt, data.za);
         }
         Ok(())
     }
@@ -829,6 +847,7 @@ impl NvmeDevice {
       let n_zones = unsafe { *(self.buffer.virt as *const u64) };
       let offset = (n + 1) * 64;
       let data = unsafe { *(self.buffer.virt.add(offset) as *const ZoneDescriptorData)};
+
       Ok(())
     }
 
@@ -841,9 +860,11 @@ impl NvmeDevice {
 		zra_field: u8, 
 		zra_spec_feats: bool
 	) -> Result<(), Box<dyn Error>> {
+
         let bytes = n_dwords * 4;
         let ptr0 = self.buffer.phys as u64;
         let ptr1 = self.get_prp2(bytes as u64);
+
 		let entry = NvmeCommand::zone_management_rcv(
             self.io_sq.tail as u16, 
             ns_id, 
@@ -854,10 +875,13 @@ impl NvmeDevice {
             zra_spec_feats,
             ptr0,
             ptr1);
+
+        let q_id = 1;    
 		let tail = self.io_sq.submit(entry);
         self.stats.submissions += 1;
-		self.write_reg_idx(NvmeArrayRegs::SQyTDBL, self.q_id as u16, tail as u32);
+		self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
 		self.io_sq.head = self.complete_io(1).unwrap() as usize;
+
         Ok(())
 	}
 
@@ -865,28 +889,26 @@ impl NvmeDevice {
 		&mut self,
 		ns_id: u32,
 		slba: u64,
-		n_dwords: u32,
-		zra: u8, 
-		zra_field: u8, 
-		zra_spec_feats: bool
+		select_all: bool,
+		zsa: u8, 
 	) -> Result<(), Box<dyn Error>> {
-        let bytes = n_dwords * 4;
+
+        let q_id = 1;
         let ptr0 = self.buffer.phys as u64;
-        let ptr1 = self.get_prp2(bytes as u64);
-		let entry = NvmeCommand::zone_management_rcv(
+
+		let entry = NvmeCommand::zone_management_send(
             self.io_sq.tail as u16, 
             ns_id, 
             slba, 
-            n_dwords, 
-            zra, 
-            zra_field, 
-            zra_spec_feats,
-            ptr0,
-            ptr1);
+            select_all, 
+            zsa,
+            ptr0);
+
 		let tail = self.io_sq.submit(entry);
         self.stats.submissions += 1;
-		self.write_reg_idx(NvmeArrayRegs::SQyTDBL, self.q_id as u16, tail as u32);
+		self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
 		self.io_sq.head = self.complete_io(1).unwrap() as usize;
+
         Ok(())
 	}
 

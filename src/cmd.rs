@@ -302,15 +302,15 @@ impl NvmeCommand {
         }
     }
 
-    pub fn zone_management_send(c_id: u16, ns_id: u32, slba: u64, select_all: bool, zsa: u8, ptr0 : u64, ptr1 : u64) -> Self {
+    pub fn zone_management_send(c_id: u16, ns_id: u32, slba: u64, select_all: bool, zsa: u8, ptr0 : u64) -> Self {
         Self {
             opcode: 0x79,
-            flags: 0, //TODO
+            flags: 0,
             c_id,
             ns_id,
             _rsvd: 0,
             md_ptr: 0,
-            d_ptr: [ptr0, ptr1], //TODO
+            d_ptr: [ptr0, 0], //TODO
             cdw10: slba as u32,
             cdw11: (slba >> 32) as u32,
             cdw12: 0,
