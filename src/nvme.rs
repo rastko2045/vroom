@@ -3,7 +3,7 @@ use crate::memory::{Dma, DmaSlice};
 use crate::pci::pci_map_resource;
 use crate::queues::*;
 use crate::zns::*;
-use crate::{NvmeNamespace, NvmeZNSInfo, NvmeStats, HUGE_PAGE_SIZE};
+use crate::{NvmeNamespace, NvmeZNSInfo, NvmeStats, HUGE_PAGE_SIZE, ZnsZsa};
 use std::collections::HashMap;
 use std::error::Error;
 use std::hint::spin_loop;
@@ -798,57 +798,43 @@ impl NvmeDevice {
     //pub fn zns_ns_get_zone_size();
     //pub fn zns_ns_get_num_zones();
 
-    //close/open/finish/reset/offline zone
-
     // ZNS specific commands
-
-    //TODO Clear zone
 
     // Zone Report Data Structure
     // See Section 3.4.2.2.1 and Figure 35 of the ZNS NVME Specification
-    fn get_zone_reports(
-        &mut self, 
-        ns_id : u32, 
-        slba : u64, 
-        n_dwords : u32,
-    ) -> Result<(), Box<dyn Error>> {
-      return self.zns_zone_mgmt_rcv(ns_id, slba, n_dwords, 0, 0, true);
-    }
-
-    pub fn get_zone_descriptors(
+    pub fn get_zone_reports(
         &mut self,
         ns_id : u32,
     ) -> Result<(), Box<dyn Error>> {
         let zones = self.namespaces.get(&ns_id).unwrap().zns_info.unwrap().n_zones;
         let n_dwords = (zones + 1) * 16; //64 bytes per zone descriptor structure
-        self.get_zone_reports(ns_id, 0, n_dwords as u32);
+        self.zns_zone_mgmt_rcv(ns_id, 0, n_dwords as u32, 0, 0, true)?;        
         let nr_zones = unsafe { *(self.buffer.virt as *const u64) };
         println!("nr_zones: {}", nr_zones);
+
         for i in 0..nr_zones {
             let offset = (i + 1) * 64;
             let data = unsafe { *(self.buffer.virt.add(offset as usize) as *const ZoneDescriptorData)};
             let zslba = data.zslba;
             let wp = data.wp;
             let zcap = data.zcap;
+            let zs = data.zs >> 4;
             println!("SLBA: 0x{:x}  WP: 0x{:x}  Cap: 0x{:x}   State: {}   Type: {}    Attrs:  0x{:x}", 
-                    zslba, wp, zcap, data.zs, data.zt, data.za);
+                    zslba, wp, zcap, zonestate_to_string(zs), zonetype_to_string(data.zt), data.za);
         }
+
         Ok(())
     }
 
-    fn get_zone_descriptor(
-        &mut self, 
-        ns_id : u32, 
-        slba : u64, 
-        n_dwords : u32,
-        n : usize
+    pub fn zone_action(
+        &mut self,
+        ns_id: u32,
+        slbda: u64,
+        all_zones: bool,
+        zsa: ZnsZsa
     ) -> Result<(), Box<dyn Error>> {
-      self.zns_zone_mgmt_rcv(ns_id, slba, n_dwords, 0, 0, true);
-      let n_zones = unsafe { *(self.buffer.virt as *const u64) };
-      let offset = (n + 1) * 64;
-      let data = unsafe { *(self.buffer.virt.add(offset) as *const ZoneDescriptorData)};
-
-      Ok(())
+        self.zns_zone_mgmt_send(ns_id, slbda, false, zsa as u8)?;
+        Ok(())
     }
 
     pub fn zns_zone_mgmt_rcv(

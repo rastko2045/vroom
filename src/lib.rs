@@ -61,3 +61,12 @@ pub struct NvmeStats {
     pub completions: u64,
     pub submissions: u64,
 }
+
+pub enum ZnsZsa {
+	CloseZone = 1,
+	FinishZone = 2,
+	OpenZone = 3,
+	ResetZone = 4,
+	OfflineZone = 5
+	// Set Zone Descriptor Extension isn't supported for now, but might be a useful feature
+}

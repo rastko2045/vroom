@@ -21,5 +21,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
     println!("{}", std::str::from_utf8(&dest)?);
 
+    nvme.zone_action(1, 0, false, vroom::ZnsZsa::CloseZone)?;
+
     Ok(())
 }
