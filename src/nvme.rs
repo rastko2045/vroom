@@ -534,8 +534,9 @@ impl NvmeDevice {
 
     // TODO: currently namespace 1 is hardcoded
     pub fn write(&mut self, data: &impl DmaSlice, mut lba: u64) -> Result<(), Box<dyn Error>> {
+        let ns = *self.namespaces.get(&1).unwrap();
         for chunk in data.chunks(2 * 4096) {
-            let blocks = (chunk.slice.len() as u64 + 512 - 1) / 512;
+            let blocks = (chunk.slice.len() as u64 + ns.block_size - 1) / ns.block_size;
             self.namespace_io(1, blocks, lba, chunk.phys_addr as u64, true)?;
             lba += blocks;
         }
@@ -544,9 +545,9 @@ impl NvmeDevice {
     }
 
     pub fn read(&mut self, dest: &impl DmaSlice, mut lba: u64) -> Result<(), Box<dyn Error>> {
-        // let ns = *self.namespaces.get(&1).unwrap();
+        let ns = *self.namespaces.get(&1).unwrap();
         for chunk in dest.chunks(2 * 4096) {
-            let blocks = (chunk.slice.len() as u64 + 512 - 1) / 512;
+            let blocks = (chunk.slice.len() as u64 + ns.block_size - 1) / ns.block_size;
             self.namespace_io(1, blocks, lba, chunk.phys_addr as u64, false)?;
             lba += blocks;
         }
@@ -646,14 +647,13 @@ impl NvmeDevice {
         batch_len: u64,
     ) -> Result<(), Box<dyn Error>> {
         let ns = *self.namespaces.get(&ns_id).unwrap();
-        let block_size = 512;
         let q_id = 1;
 
         for chunk in data.chunks(HUGE_PAGE_SIZE) {
             self.buffer[..chunk.len()].copy_from_slice(chunk);
             let tail = self.io_sq.tail;
 
-            let batch_len = std::cmp::min(batch_len, chunk.len() as u64 / block_size);
+            let batch_len = std::cmp::min(batch_len, chunk.len() as u64 / ns.block_size);
             let batch_size = chunk.len() as u64 / batch_len;
             let blocks = batch_size / ns.block_size;
 
@@ -686,13 +686,12 @@ impl NvmeDevice {
         batch_len: u64,
     ) -> Result<(), Box<dyn Error>> {
         let ns = *self.namespaces.get(&ns_id).unwrap();
-        let block_size = 512;
         let q_id = 1;
 
         for chunk in data.chunks_mut(HUGE_PAGE_SIZE) {
             let tail = self.io_sq.tail;
 
-            let batch_len = std::cmp::min(batch_len, chunk.len() as u64 / block_size);
+            let batch_len = std::cmp::min(batch_len, chunk.len() as u64 / ns.block_size);
             let batch_size = chunk.len() as u64 / batch_len;
             let blocks = batch_size / ns.block_size;
 
@@ -730,8 +729,9 @@ impl NvmeDevice {
         assert!(blocks <= 0x1_0000);
 
         let q_id = 1;
+        let ns = *self.namespaces.get(&ns_id).unwrap();
 
-        let bytes = blocks * 512;
+        let bytes = blocks * ns.block_size;
         let ptr1 = self.get_prp2(bytes);
 
         let entry = if write {
@@ -837,6 +837,46 @@ impl NvmeDevice {
         Ok(())
     }
 
+    pub fn append_io(
+        &mut self,
+        ns_id: u32,
+        slba: u64,
+        data: &[u8]
+    ) -> Result<(), Box<dyn Error>> {
+        let ns = *self.namespaces.get(&1).unwrap();
+        for chunk in data.chunks(128 * 4096) {
+            self.buffer[..chunk.len()].copy_from_slice(chunk);
+            let blocks = (chunk.len() as u64 + ns.block_size - 1) / ns.block_size;
+            println!("blocks {}", blocks);
+            self.zone_append(ns_id, slba, blocks as u16)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn zone_append(
+        &mut self,
+        ns_id: u32,
+        slba: u64,
+        n_blocks: u16
+    ) -> Result<(), Box<dyn Error>> { //TODO would be better to return the real result
+        
+        let ns = *self.namespaces.get(&ns_id).unwrap();
+        let bytes = n_blocks * (ns.block_size as u16);
+        let ptr0 = self.buffer.phys as u64;
+        let ptr1 = self.get_prp2(bytes as u64);
+
+        let entry = NvmeCommand::zone_append(self.io_sq.tail as u16, ns_id, slba, n_blocks - 1, ptr0, ptr1);
+        
+        let q_id = 1;    
+		let tail = self.io_sq.submit(entry);
+        self.stats.submissions += 1;
+		self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
+		self.io_sq.head = self.complete_io(1).unwrap() as usize;
+        
+        Ok(())
+    }
+
     pub fn zns_zone_mgmt_rcv(
 		&mut self,
 		ns_id: u32,
@@ -897,6 +937,8 @@ impl NvmeDevice {
 
         Ok(())
 	}
+
+    
 
     /// Gets PRP2 value depending on the size of the data to be transferred
     fn get_prp2(&self, bytes : u64) -> u64 {

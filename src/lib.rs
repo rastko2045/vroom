@@ -44,16 +44,12 @@ pub struct NvmeNamespace {
     pub block_size: u64,
     pub flba_idx: u8, //LBA Format index
     pub zns_info : Option<NvmeZNSInfo>
-    //an optional zns struct that will save some information on the zns parts, most importantly 
-    //zone size, number of zones
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct NvmeZNSInfo {
     pub zone_size: u64, //in number of blocks
     pub n_zones: u64
-    //an optional zns struct that will save some information on the zns parts, most importantly 
-    //zone size, number of zones
 }
 
 #[derive(Debug, Clone, Default)]

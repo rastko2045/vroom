@@ -337,4 +337,22 @@ impl NvmeCommand {
             cdw15: 0
         }
     }
+
+    pub fn zone_append(c_id: u16, ns_id: u32, slba: u64, n_blocks: u16, ptr0: u64, ptr1: u64) -> Self {
+        Self {
+            opcode: 0x7D,
+            flags: 0,
+            c_id,
+            ns_id,
+            _rsvd: 0,
+            md_ptr: 0,
+            d_ptr: [ptr0, ptr1],
+            cdw10: slba as u32,
+            cdw11: (slba >> 32) as u32,
+            cdw12: n_blocks as u32,
+            cdw13: 0,
+            cdw14: 0,
+            cdw15: 0,
+        }
+    }
 }

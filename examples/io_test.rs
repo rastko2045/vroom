@@ -45,9 +45,10 @@ fn qd1(
 ) -> Result<NvmeDevice, Box<dyn Error>> {
     let mut buffer: Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE)?;
 
-    let blocks = 8;
-    let bytes = 512 * blocks;
-    let ns_blocks = nvme.namespaces.get(&1).unwrap().blocks / blocks - 1; // - blocks - 1;
+    let ns = nvme.namespaces.get(&1).unwrap();
+    let blocks = 8; // Blocks that will be read/written at a time
+    let bytes = blocks * ns.block_size;
+    let ns_blocks = ns.blocks / blocks - 1; // - blocks - 1;
 
     let mut rng = thread_rng();
     let seq = if random {
@@ -237,10 +238,11 @@ fn qd_n(
 
 fn fill_ns(nvme: &mut NvmeDevice) {
     let buffer: Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE).unwrap();
-    let max_lba = nvme.namespaces.get(&1).unwrap().blocks - buffer.size as u64 / 512 - 1;
-    let blocks = buffer.size as u64 / 512;
+    let block_size = nvme.namespaces.get(&1).unwrap().block_size;
+    let max_lba = nvme.namespaces.get(&1).unwrap().blocks - buffer.size as u64 / block_size - 1;
+    let blocks = buffer.size as u64 / block_size;
     let mut lba = 0;
-    while lba < max_lba - 512 {
+    while lba < max_lba - block_size {
         nvme.write(&buffer, lba).unwrap();
         lba += blocks;
     }
