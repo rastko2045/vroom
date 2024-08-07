@@ -282,6 +282,25 @@ impl NvmeCommand {
         }
     }
 
+    // TODO this is optional, need to check if it's supported
+    pub fn copy(c_id: u16, ns_id: u32, sdlba: u64, ptr0: u64) -> Self {
+        Self {
+            opcode: 0x19,
+            flags: 0,
+            c_id,
+            ns_id,
+            _rsvd: 0,
+            md_ptr: 0,
+            d_ptr: [ptr0, 0],
+            cdw10: sdlba as u32,
+            cdw11: (sdlba >> 32) as u32,
+            cdw12: 0,
+            cdw13: 0,
+            cdw14: 0,
+            cdw15: 0,
+        }
+    }
+
     // not supported by samsung
     pub fn write_zeroes(c_id: u16, ns_id: u32, slba: u64, nlb: u16, deac: bool) -> Self {
         Self {

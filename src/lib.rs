@@ -11,6 +11,8 @@ mod pci;
 mod queues;
 #[allow(dead_code)]
 mod zns;
+#[allow(dead_code)]
+mod nonseq;
 
 pub use memory::HUGE_PAGE_SIZE;
 pub use nvme::{NvmeDevice, NvmeQueuePair};

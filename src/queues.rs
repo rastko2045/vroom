@@ -9,10 +9,10 @@ use std::hint::spin_loop;
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C, packed)]
 pub struct NvmeCompletion {
-    /// Command specific
-    pub command_specific: u32,
-    /// Reserved
-    pub _rsvd: u32,
+    /// Command specific 1 (DW0)
+    pub command_specific1: u32,
+    /// Command specific 2 (DW1)
+    pub command_specific2: u32,
     // Submission queue head
     pub sq_head: u16,
     // Submission queue ID

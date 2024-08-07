@@ -618,7 +618,7 @@ impl NvmeDevice {
         self.io_sq.submit_checked(entry)
     }
 
-    fn complete_io(&mut self, step: u64) -> Option<u16> {
+    fn complete_io(&mut self, step: u64) -> Option<NvmeCompletion> {
         let q_id = 1;
 
         let (tail, c_entry, _) = self.io_cq.complete_n(step as usize);
@@ -636,7 +636,7 @@ impl NvmeDevice {
             return None;
         }
         self.stats.completions += 1;
-        Some(c_entry.sq_head)
+        Some(c_entry)
     }
 
     pub fn batched_write(
@@ -672,7 +672,7 @@ impl NvmeDevice {
                 }
                 lba += blocks;
             }
-            self.io_sq.head = self.complete_io(batch_len).unwrap() as usize;
+            self.io_sq.head = self.complete_io(batch_len).unwrap().sq_head as usize;
         }
 
         Ok(())
@@ -710,7 +710,7 @@ impl NvmeDevice {
                 }
                 lba += blocks;
             }
-            self.io_sq.head = self.complete_io(batch_len).unwrap() as usize;
+            self.io_sq.head = self.complete_io(batch_len).unwrap().sq_head as usize;
             chunk.copy_from_slice(&self.buffer[..chunk.len()]);
         }
         Ok(())
@@ -758,7 +758,7 @@ impl NvmeDevice {
         self.stats.submissions += 1;
 
         self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
-        self.io_sq.head = self.complete_io(1).unwrap() as usize;
+        self.io_sq.head = self.complete_io(1).unwrap().sq_head as usize;
         Ok(())
     }
 
@@ -842,16 +842,24 @@ impl NvmeDevice {
         ns_id: u32,
         slba: u64,
         data: &[u8]
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<u64, Box<dyn Error>> {
         let ns = *self.namespaces.get(&1).unwrap();
+        let mut is_first = true;
+        let mut result = 0;
         for chunk in data.chunks(128 * 4096) {
             self.buffer[..chunk.len()].copy_from_slice(chunk);
             let blocks = (chunk.len() as u64 + ns.block_size - 1) / ns.block_size;
             println!("blocks {}", blocks);
-            self.zone_append(ns_id, slba, blocks as u16)?;
+            if is_first {
+                result = self.zone_append(ns_id, slba, blocks as u16)?;
+                is_first = false;
+            }
+            else {
+                self.zone_append(ns_id, slba, blocks as u16)?;
+            }
         }
 
-        Ok(())
+        Ok(result)
     }
 
     pub fn zone_append(
@@ -859,7 +867,7 @@ impl NvmeDevice {
         ns_id: u32,
         slba: u64,
         n_blocks: u16
-    ) -> Result<(), Box<dyn Error>> { //TODO would be better to return the real result
+    ) -> Result<u64, Box<dyn Error>> {
         
         let ns = *self.namespaces.get(&ns_id).unwrap();
         let bytes = n_blocks * (ns.block_size as u16);
@@ -872,9 +880,12 @@ impl NvmeDevice {
 		let tail = self.io_sq.submit(entry);
         self.stats.submissions += 1;
 		self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
-		self.io_sq.head = self.complete_io(1).unwrap() as usize;
+
+        let completion_entry = self.complete_io(1).unwrap();
+		self.io_sq.head = completion_entry.sq_head as usize;
         
-        Ok(())
+        let result = (completion_entry.command_specific2 as u64) << 32 | completion_entry.command_specific1 as u64;
+        Ok(result)
     }
 
     pub fn zns_zone_mgmt_rcv(
@@ -906,7 +917,7 @@ impl NvmeDevice {
 		let tail = self.io_sq.submit(entry);
         self.stats.submissions += 1;
 		self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
-		self.io_sq.head = self.complete_io(1).unwrap() as usize;
+		self.io_sq.head = self.complete_io(1).unwrap().sq_head as usize;
 
         Ok(())
 	}
@@ -933,7 +944,7 @@ impl NvmeDevice {
 		let tail = self.io_sq.submit(entry);
         self.stats.submissions += 1;
 		self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
-		self.io_sq.head = self.complete_io(1).unwrap() as usize;
+		self.io_sq.head = self.complete_io(1).unwrap().sq_head as usize;
 
         Ok(())
 	}
