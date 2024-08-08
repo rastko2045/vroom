@@ -5,7 +5,7 @@ use std::error::Error;
 
 const ZNS_MAP_UNMAPPED: u64 = 0xFFFFFFFFFFFFFFFF;
 
-struct ZNSMap {
+pub struct ZNSMap {
 
     l2d: Vec<u64>, //Logical to device mapping
     d2l: Vec<u64>, //Device to logical mapping, needed when copying zones for reclaiming
@@ -24,6 +24,7 @@ impl ZNSMap {
         let invalid_bitmap = vec![false; n_blocks_device];
         Self {
             l2d,
+
             d2l,
             invalid_bitmap
         }
@@ -33,16 +34,24 @@ impl ZNSMap {
         self.l2d[lba as usize]
     }
 
-    // Looks up the longest contiguous block of unmapped blocks starting from the block mapped to lba
-    // Returns the mapped block and the length of the contiguous unmapped blocks (potentially 0)
-    pub fn lookup_unmapped(&self, lba: u64) -> (u64, u64) {
-        let mut len = 0;
-        let mut d_lba = self.l2d[lba as usize];
-        while d_lba == ZNS_MAP_UNMAPPED {
-            d_lba = self.l2d[(lba + len) as usize];
-            len += 1;
+    // Looks up the longest contiguous physical blocks that are mapped to logical blocks starting from lba
+    pub fn lookup_contiguous_physical(&self, lba: u64, len: u64) -> Result<u64, Box<dyn Error>> {
+        let mut result = 1;
+        let d_lba_start = self.l2d[lba as usize];
+        if d_lba_start == ZNS_MAP_UNMAPPED {
+            return Err("Block not mapped".into());
         }
-        (d_lba, len)
+        for i in 1..len {
+            let d_lba = self.l2d[(lba + i) as usize];
+            if d_lba == ZNS_MAP_UNMAPPED {
+                return Err("Block not mapped".into());
+            }
+            if d_lba != d_lba_start + i {
+                break;
+            }
+            result += 1;
+        }
+        Ok(result)
     }
 
     // Looks up the longest contiguous block of (mapped or unmapped depending on lba) blocks starting from lba
@@ -141,27 +150,41 @@ impl ZNSMap {
 
 pub struct MapperZone {
     slba: u64,
+    zone_size: u64, // Kinda unnecessary because all zones have the same size, but this is more convenient. Maybe TODO and refactor
+    wp: u64,
     invalid_blocks: u64
     //GC algorithms data will come here
 }
 
 
 impl MapperZone {
-    pub fn new(slba: u64) -> Self {
+    pub fn new(slba: u64, zone_size: u64) -> Self {
         Self {
             slba,
+            zone_size,
+            wp: slba,
             invalid_blocks: 0
         }
+    }
+    pub fn incr_wp(&mut self, incr: u64) -> Result<(), Box<dyn Error>> {
+        if self.wp + incr > self.slba + self.zone_size {
+            return Err("Write pointer out of bounds".into());
+        }
+        self.wp += incr;
+        Ok(())
+    }
+    pub fn is_full (&self) -> bool {
+        self.wp == self.slba + self.zone_size
     }
 }
 
 pub struct ZNSTarget {
 
-    backing: NvmeDevice, //Backing ZNS device
+    pub backing: NvmeDevice, //Backing ZNS device
     max_lba: u64, //last exposed lba (that can be written into)
     exposed_zones: u64,
     zns_info: NvmeZNSInfo, 
-    map: ZNSMap,
+    pub map: ZNSMap, //TODO remove pub on this and ZNSMap, for debugging purposes
     // These are mutually exclusive, and the union of them all represents all zones in the backing device
     current_zone: MapperZone, //SLBA of the current zone
     free_zones: Vec<MapperZone>,
@@ -172,6 +195,7 @@ pub struct ZNSTarget {
 
 impl ZNSTarget {
 
+    //TODO Backing being moved is bothering me 
     pub fn init(op_rate: f32, backing: NvmeDevice) -> Result<Self, Box<dyn Error>> { //TODO backing ref
         if op_rate >= 1. || op_rate < 0. {
             return Err("Invalid overprovisioning rate".into())
@@ -181,20 +205,20 @@ impl ZNSTarget {
             Some(info) => info,
             None => return Err("Not a ZNS device".into())
         };
-        let exposed_zones = zns_info.n_zones * (1.0 - op_rate) as u64;
+        let exposed_zones = ((zns_info.n_zones as f32) * (1.0 - op_rate)) as u64;
         let exposed_blocks = exposed_zones * zns_info.zone_size;
         let total_blocks = ns.blocks;
 
-        let current_zone = MapperZone::new(0);
+        let current_zone = MapperZone::new(0, zns_info.zone_size);
 
         let mut free_zones = Vec::new();
         for i in 1..exposed_zones {
-            free_zones.push(MapperZone::new(i * zns_info.zone_size));
+            free_zones.push(MapperZone::new(i * zns_info.zone_size, zns_info.zone_size));
         }
 
         let mut op_zones = Vec::new();
         for i in exposed_zones..zns_info.n_zones {
-            op_zones.push(MapperZone::new(i * zns_info.zone_size));
+            op_zones.push(MapperZone::new(i * zns_info.zone_size, zns_info.zone_size));
         }
 
         let full_zones = Vec::new();
@@ -224,24 +248,22 @@ impl ZNSTarget {
         let mut current_array = dest;
 
         while blocks > 0 {
-            let zone_boundary = ((current_lba / self.zns_info.zone_size) + 1) * self.zns_info.zone_size; // the next zone boundary
+            let zone_boundary = self.current_zone.slba + self.zns_info.zone_size;
             let backing_block = self.map.lookup(current_lba);
             if backing_block == ZNS_MAP_UNMAPPED {
                 return Err("Block not mapped".into());
             }
 
-            let length = if blocks > (zone_boundary - current_lba) {
-                zone_boundary - current_lba
-            } else {
-                blocks
-            };
-
-            let (first, rest) = current_array.split_at_mut((length * block_size) as usize);
+            let length: u64 = Ord::min(blocks, zone_boundary - self.current_zone.wp);
+            let length_contiguous = self.map.lookup_contiguous_physical(current_lba, length)?;
+            
+            let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.len());
+            let (first, rest) = current_array.split_at_mut(split_index);
             current_array = rest;
 
             self.backing.read_copied(first, backing_block)?;
-            blocks -= length;
-            current_lba += length;
+            blocks -= length_contiguous;
+            current_lba += length_contiguous;
         }
 
         Ok(())
@@ -259,21 +281,18 @@ impl ZNSTarget {
         let mut current_array = data;
 
         while blocks > 0 {
-            let zone_boundary = ((current_lba / self.zns_info.zone_size) + 1) * self.zns_info.zone_size; // the next zone boundary
+            let zone_boundary = self.current_zone.slba + self.zns_info.zone_size;
             let backing_block = self.map.lookup(current_lba);
 
-            let length = if blocks > (zone_boundary - current_lba) {
-                zone_boundary - current_lba
-            } else {
-                blocks
-            };
-
+            let length = Ord::min(blocks, zone_boundary - self.current_zone.wp);
             let length_contiguous = self.map.lookup_contiguous_map(current_lba, length);
-            let (first, rest) = current_array.split_at((length_contiguous * block_size) as usize);
-            current_array = rest;
 
+            let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.len());
+            let (first, rest) = current_array.split_at(split_index);
+            current_array = rest;
             let d_lba = self.backing.append_io(1, self.current_zone.slba, first)?;
             self.map.update_len(current_lba, d_lba, length_contiguous as u64);
+            self.current_zone.incr_wp(length_contiguous)?;
 
             if backing_block != ZNS_MAP_UNMAPPED {
                 self.map.mark_invalid_len(backing_block, length_contiguous);
@@ -284,7 +303,7 @@ impl ZNSTarget {
             blocks -= length_contiguous;
             current_lba += length_contiguous;
 
-            if current_lba == zone_boundary {
+            if self.current_zone.is_full() {
                 if self.free_zones.is_empty() {
                     self.reclaim()?;
                 }

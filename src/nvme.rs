@@ -795,9 +795,6 @@ impl NvmeDevice {
         self.submit_and_complete_admin(|c_id, _| NvmeCommand::format_nvm(c_id, ns_id));
     }
 
-    //pub fn zns_ns_get_zone_size();
-    //pub fn zns_ns_get_num_zones();
-
     // ZNS specific commands
 
     // Zone Report Data Structure
@@ -833,7 +830,7 @@ impl NvmeDevice {
         all_zones: bool,
         zsa: ZnsZsa
     ) -> Result<(), Box<dyn Error>> {
-        self.zns_zone_mgmt_send(ns_id, slbda, false, zsa as u8)?;
+        self.zns_zone_mgmt_send(ns_id, slbda, all_zones, zsa as u8)?;
         Ok(())
     }
 
@@ -849,7 +846,6 @@ impl NvmeDevice {
         for chunk in data.chunks(128 * 4096) {
             self.buffer[..chunk.len()].copy_from_slice(chunk);
             let blocks = (chunk.len() as u64 + ns.block_size - 1) / ns.block_size;
-            println!("blocks {}", blocks);
             if is_first {
                 result = self.zone_append(ns_id, slba, blocks as u16)?;
                 is_first = false;
