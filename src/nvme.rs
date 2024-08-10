@@ -295,6 +295,8 @@ impl NvmeDevice {
         // let mpsmax = ((dev.get_reg64(NvmeRegs64::CAP as u64) >> 52) & 0xF) as u32;
         // cc |= (mpsmax << 7);
         // println!("MPS {}", (cc >> 7) & 0xF);
+        println!("MPSMIN: {}", (dev.get_reg64(NvmeRegs64::CAP as u64) >> 48) & 0xF);
+
         dev.set_reg32(NvmeRegs32::CC as u32, cc);
 
         // Enable the controller
@@ -801,7 +803,7 @@ impl NvmeDevice {
     // See Section 3.4.2.2.1 and Figure 35 of the ZNS NVME Specification
     pub fn get_zone_reports(
         &mut self,
-        ns_id : u32,
+        ns_id: u32,
     ) -> Result<(), Box<dyn Error>> {
         let zones = self.namespaces.get(&ns_id).unwrap().zns_info.unwrap().n_zones;
         let n_dwords = (zones + 1) * 16; //64 bytes per zone descriptor structure
@@ -823,6 +825,26 @@ impl NvmeDevice {
         Ok(())
     }
 
+    pub fn get_zone_descriptors(
+        &mut self,
+        ns_id: u32,
+    ) -> Result<Vec<ZoneDescriptorData>, Box<dyn Error>> {
+        let zones = self.namespaces.get(&ns_id).unwrap().zns_info.unwrap().n_zones;
+        let n_dwords = (zones + 1) * 16; //64 bytes per zone descriptor structure
+        self.zns_zone_mgmt_rcv(ns_id, 0, n_dwords as u32, 0, 0, true)?;        
+        let nr_zones = unsafe { *(self.buffer.virt as *const u64) };
+
+        let mut result: Vec<ZoneDescriptorData> = Vec::with_capacity(nr_zones as usize);
+
+        for i in 0..nr_zones {
+            let offset = (i + 1) * 64;
+            let data = unsafe { *(self.buffer.virt.add(offset as usize) as *const ZoneDescriptorData)};
+            result.push(data);
+        }
+
+        Ok(result)
+    }
+
     pub fn zone_action(
         &mut self,
         ns_id: u32,
@@ -834,6 +856,7 @@ impl NvmeDevice {
         Ok(())
     }
 
+    // TODO: find out ZASL, most likely 32 * 4096
     pub fn append_io(
         &mut self,
         ns_id: u32,
@@ -843,7 +866,7 @@ impl NvmeDevice {
         let ns = *self.namespaces.get(&1).unwrap();
         let mut is_first = true;
         let mut result = 0;
-        for chunk in data.chunks(128 * 4096) {
+        for chunk in data.chunks(32 * 4096) {
             self.buffer[..chunk.len()].copy_from_slice(chunk);
             let blocks = (chunk.len() as u64 + ns.block_size - 1) / ns.block_size;
             if is_first {
@@ -866,12 +889,11 @@ impl NvmeDevice {
     ) -> Result<u64, Box<dyn Error>> {
         
         let ns = *self.namespaces.get(&ns_id).unwrap();
-        let bytes = n_blocks * (ns.block_size as u16);
+        let bytes = (n_blocks as u64) * ns.block_size;
         let ptr0 = self.buffer.phys as u64;
-        let ptr1 = self.get_prp2(bytes as u64);
+        let ptr1 = self.get_prp2(bytes);
 
         let entry = NvmeCommand::zone_append(self.io_sq.tail as u16, ns_id, slba, n_blocks - 1, ptr0, ptr1);
-        
         let q_id = 1;    
 		let tail = self.io_sq.submit(entry);
         self.stats.submissions += 1;
@@ -894,9 +916,9 @@ impl NvmeDevice {
 		zra_spec_feats: bool
 	) -> Result<(), Box<dyn Error>> {
 
-        let bytes = n_dwords * 4;
+        let bytes = (n_dwords as u64) * 4;
         let ptr0 = self.buffer.phys as u64;
-        let ptr1 = self.get_prp2(bytes as u64);
+        let ptr1 = self.get_prp2(bytes);
 
 		let entry = NvmeCommand::zone_management_rcv(
             self.io_sq.tail as u16, 

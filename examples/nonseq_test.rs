@@ -14,22 +14,21 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let nvme = vroom::init(&pci_addr)?;
-    let mut zns_target = vroom::nonseq::ZNSTarget::init(0.3, nvme)?;
+    let mut znstarget = vroom::nonseq::ZNSTarget::init(0.3, nvme)?;
 
-    zns_target.backing.zone_action(1, 0, true, vroom::ZnsZsa::ResetZone)?;
+    znstarget.backing.zone_action(1, 0, true, vroom::ZnsZsa::ResetZone)?;
 
-    const N_BLOCKS : usize = 2;
-    let src1 = ['a' as u8; 4096 * N_BLOCKS];
-    let src2 = ['b' as u8; 4096 * N_BLOCKS];
+    const N_BLOCKS : usize = 100;
+    let src1 = vec!('a' as u8; 4096 * N_BLOCKS);
+    znstarget.backing.append_io(1, 0, &src1)?;
 
-    zns_target.write_copied(&src1, 1)?; //TODO investigate
+    //let src2 = ['b' as u8; 4096 * N_BLOCKS];
 
-    zns_target.write_copied(&src2, 0)?;
+    //znstarget.write_copied(&src1, 0)?;
 
-
-    let mut dest = [0u8; 4096 * N_BLOCKS];
-    zns_target.read_copied(&mut dest, 0)?;
-    println!("{}", std::str::from_utf8(&dest)?);
-    zns_target.backing.get_zone_reports(0)?;
+    //let mut dest = [0u8; 10];
+    //znstarget.read_copied(&mut dest, 0)?;
+    znstarget.backing.get_zone_reports(1)?;
+    //println!("{}", std::str::from_utf8(&dest)?);
     Ok(())
 }

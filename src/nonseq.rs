@@ -149,8 +149,8 @@ impl ZNSMap {
 }
 
 pub struct MapperZone {
-    slba: u64,
-    zone_size: u64, // Kinda unnecessary because all zones have the same size, but this is more convenient. Maybe TODO and refactor
+    zslba: u64,
+    zone_cap: u64, // Kinda unnecessary because all zones have the same size, but this is more convenient. Maybe TODO and refactor
     wp: u64,
     invalid_blocks: u64
     //GC algorithms data will come here
@@ -158,23 +158,23 @@ pub struct MapperZone {
 
 
 impl MapperZone {
-    pub fn new(slba: u64, zone_size: u64) -> Self {
+    pub fn new(zslba: u64, zone_cap: u64) -> Self {
         Self {
-            slba,
-            zone_size,
-            wp: slba,
+            zslba,
+            zone_cap,
+            wp: zslba,
             invalid_blocks: 0
         }
     }
     pub fn incr_wp(&mut self, incr: u64) -> Result<(), Box<dyn Error>> {
-        if self.wp + incr > self.slba + self.zone_size {
+        if self.wp + incr > self.zslba + self.zone_cap {
             return Err("Write pointer out of bounds".into());
         }
         self.wp += incr;
         Ok(())
     }
     pub fn is_full (&self) -> bool {
-        self.wp == self.slba + self.zone_size
+        self.wp == self.zslba + self.zone_cap
     }
 }
 
@@ -186,7 +186,7 @@ pub struct ZNSTarget {
     zns_info: NvmeZNSInfo, 
     pub map: ZNSMap, //TODO remove pub on this and ZNSMap, for debugging purposes
     // These are mutually exclusive, and the union of them all represents all zones in the backing device
-    current_zone: MapperZone, //SLBA of the current zone
+    current_zone: Option<MapperZone>,
     free_zones: Vec<MapperZone>,
     full_zones: Vec<MapperZone>,
     op_zones: Vec<MapperZone>
@@ -196,7 +196,7 @@ pub struct ZNSTarget {
 impl ZNSTarget {
 
     //TODO Backing being moved is bothering me 
-    pub fn init(op_rate: f32, backing: NvmeDevice) -> Result<Self, Box<dyn Error>> { //TODO backing ref
+    pub fn init(op_rate: f32, mut backing: NvmeDevice) -> Result<Self, Box<dyn Error>> { //TODO backing ref
         if op_rate >= 1. || op_rate < 0. {
             return Err("Invalid overprovisioning rate".into())
         }
@@ -208,17 +208,20 @@ impl ZNSTarget {
         let exposed_zones = ((zns_info.n_zones as f32) * (1.0 - op_rate)) as u64;
         let exposed_blocks = exposed_zones * zns_info.zone_size;
         let total_blocks = ns.blocks;
+        let zone_descriptors = backing.get_zone_descriptors(1)?;
 
-        let current_zone = MapperZone::new(0, zns_info.zone_size);
+        let current_zone = Some(MapperZone::new(0, zone_descriptors[0].zcap));
 
         let mut free_zones = Vec::new();
         for i in 1..exposed_zones {
-            free_zones.push(MapperZone::new(i * zns_info.zone_size, zns_info.zone_size));
+            let zslba = i * zns_info.zone_size;
+            free_zones.push(MapperZone::new(zslba, zone_descriptors[i as usize].zcap));
         }
 
         let mut op_zones = Vec::new();
         for i in exposed_zones..zns_info.n_zones {
-            op_zones.push(MapperZone::new(i * zns_info.zone_size, zns_info.zone_size));
+            let zslba = i * zns_info.zone_size;
+            op_zones.push(MapperZone::new(zslba, zone_descriptors[i as usize].zcap));        
         }
 
         let full_zones = Vec::new();
@@ -238,23 +241,27 @@ impl ZNSTarget {
 
     pub fn read_copied(&mut self, dest: &mut [u8], lba: u64) -> Result<(), Box<dyn Error>> {
 
-        if(lba + dest.len() as u64) > self.max_lba {
-            return Err("Read out of bounds".into());
-        }
-
         let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
         let mut blocks = (dest.len() as u64 + block_size - 1) / block_size;
         let mut current_lba = lba;
         let mut current_array = dest;
 
+        if(lba + blocks as u64) > self.max_lba {
+            return Err("Read out of bounds".into());
+        }
+
         while blocks > 0 {
-            let zone_boundary = self.current_zone.slba + self.zns_info.zone_size;
             let backing_block = self.map.lookup(current_lba);
             if backing_block == ZNS_MAP_UNMAPPED {
                 return Err("Block not mapped".into());
             }
 
-            let length: u64 = Ord::min(blocks, zone_boundary - self.current_zone.wp);
+            // Find the zslba of the backing block
+            let backing_zone = backing_block / self.zns_info.zone_size;
+            let backing_zone_zslba: u64 = backing_zone * self.zns_info.zone_size;
+            let zone_boundary = backing_zone_zslba + self.zns_info.zone_size;
+
+            let length: u64 = Ord::min(blocks, zone_boundary - current_lba);
             let length_contiguous = self.map.lookup_contiguous_physical(current_lba, length)?;
             
             let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.len());
@@ -271,60 +278,71 @@ impl ZNSTarget {
 
     pub fn write_copied(&mut self, data: &[u8],  lba: u64) -> Result<(), Box<dyn Error>> {
 
-        if(lba + data.len() as u64) > self.max_lba {
-            return Err("Write out of bounds".into());
-        }
-
         let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
         let mut blocks = (data.len() as u64 + block_size - 1) / block_size;
         let mut current_lba = lba;
         let mut current_array = data;
 
+        if (lba + blocks as u64) > self.max_lba {
+            return Err("Write out of bounds".into());
+        }
+
         while blocks > 0 {
-            let zone_boundary = self.current_zone.slba + self.zns_info.zone_size;
+
+            let current_zone = match &mut self.current_zone {
+                Some(current_zone) => current_zone,
+                None => return Err("Ran out of space!".into())
+            };
+
+            let zone_boundary = current_zone.zslba + current_zone.zone_cap;
             let backing_block = self.map.lookup(current_lba);
 
-            let length = Ord::min(blocks, zone_boundary - self.current_zone.wp);
+            let length = Ord::min(blocks, zone_boundary - current_zone.wp);
             let length_contiguous = self.map.lookup_contiguous_map(current_lba, length);
 
             let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.len());
             let (first, rest) = current_array.split_at(split_index);
             current_array = rest;
-            let d_lba = self.backing.append_io(1, self.current_zone.slba, first)?;
+            let d_lba = self.backing.append_io(1, current_zone.zslba, first)?;
             self.map.update_len(current_lba, d_lba, length_contiguous as u64);
-            self.current_zone.incr_wp(length_contiguous)?;
+            current_zone.incr_wp(length_contiguous)?;
 
             if backing_block != ZNS_MAP_UNMAPPED {
                 self.map.mark_invalid_len(backing_block, length_contiguous);
-                self.current_zone.invalid_blocks += length_contiguous;
+                current_zone.invalid_blocks += length_contiguous;
                 assert!(self.map.count_mapped(current_lba, length_contiguous) == length_contiguous);
             }
 
             blocks -= length_contiguous;
             current_lba += length_contiguous;
 
-            if self.current_zone.is_full() {
+            if current_zone.is_full() {
                 if self.free_zones.is_empty() {
                     self.reclaim()?;
                 }
                 match self.free_zones.pop() {
                     Some(zone) => {
-                        let full_zone = std::mem::replace(&mut self.current_zone, zone);
-                        self.full_zones.push(full_zone);
+                        let full_zone = std::mem::replace(&mut self.current_zone, Some(zone));
+                        self.full_zones.push(full_zone.unwrap());
                     },
                     None => {
-                        return Err("Despite reclaiming, no free zones available".into());
+                        return Err("Despite reclaiming, no free zones available. Most likely full.".into());
                     }
                 }
             }
         }
-        Ok(())
+        return Ok(())
     }
 
     fn reclaim(&mut self) -> Result<(), Box<dyn Error>> {
-        self.full_zones.sort_by(|a, b| a.invalid_blocks.cmp(&b.invalid_blocks));
-        if self.full_zones.is_empty() {
-            return Err("No full zones to reclaim; This shouldn't even happen?".into());
+        
+        let mut reclaimable_zones : Vec<&MapperZone> = self.full_zones.iter()
+            .filter(|z| z.invalid_blocks > 0)
+            .collect();
+        reclaimable_zones.sort_by(|a, b| a.invalid_blocks.cmp(&b.invalid_blocks));
+        
+        if reclaimable_zones.is_empty() {
+            return Ok(());
         }
         if self.op_zones.is_empty() && self.free_zones.is_empty() {
             return Err("No free zones to reclaim to".into());
@@ -339,20 +357,20 @@ impl ZNSTarget {
         let victim = self.full_zones.pop().unwrap(); //This should be an entire method depending on the victim selection method
 
         // Copy the valid data from the victim to the op zone
-        let mut victim_block = victim.slba;
-        while victim_block < victim.slba + self.zns_info.zone_size {
-            let valid_len = self.map.lookup_contiguous_valid(victim_block, self.zns_info.zone_size);
+        let mut victim_block = victim.zslba;
+        while victim_block < victim.zslba + victim.zone_cap {
+            let valid_len = self.map.lookup_contiguous_valid(victim_block, victim.zone_cap);
             if valid_len == 0 {
-                let invalid_len = self.map.lookup_contiguous_invalid(victim_block, self.zns_info.zone_size);
+                let invalid_len = self.map.lookup_contiguous_invalid(victim_block, victim.zone_cap);
                 victim_block += invalid_len;
             }
             //append valid_len blocks from victim to op_zone
         }
         // Remap the valid data from the victim to the op zone
-        self.map.remap(victim.slba, op_zone.slba, self.zns_info.zone_size);
+        self.map.remap(victim.zslba, op_zone.zslba, victim.zone_cap);
         // The victim block is now free and can be reset and added to the overprovisioning zones.
         // and The overprovisioning zone can now be used as a free zone
-        self.backing.zone_action(1, victim.slba, false, ZnsZsa::ResetZone)?;
+        self.backing.zone_action(1, victim.zslba, false, ZnsZsa::ResetZone)?;
         self.op_zones.push(victim);
         self.free_zones.push(op_zone);
         
