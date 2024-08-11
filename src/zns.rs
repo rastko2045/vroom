@@ -1,5 +1,3 @@
-use std::vec;
-
 // Identify Namespace Data Structure for the ZNS Command Set
 // See section 4.1.5.1 and Figure 48 of the ZNS NVME specification.
 #[repr(C, packed)]

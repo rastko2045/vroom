@@ -1,6 +1,4 @@
-use crate::NvmeDevice;
-use crate::NvmeZNSInfo;
-use crate::ZnsZsa;
+use crate::{NvmeDevice, NvmeZNSInfo, ZnsZsa};
 use std::error::Error;
 
 const ZNS_MAP_UNMAPPED: u64 = 0xFFFFFFFFFFFFFFFF;
@@ -20,7 +18,7 @@ impl ZNSMap {
     //n_blocks_device is the number of blocks in the backing device
     pub fn init(n_blocks_logical: usize, n_blocks_device: usize) -> Self {
         let l2d = vec![ZNS_MAP_UNMAPPED; n_blocks_logical];
-        let d2l = vec![ZNS_MAP_UNMAPPED; n_blocks_logical]; //TODO I think this should be n_blocks_device
+        let d2l = vec![ZNS_MAP_UNMAPPED; n_blocks_device];
         let invalid_bitmap = vec![false; n_blocks_device];
         Self {
             l2d,
@@ -156,7 +154,6 @@ pub struct MapperZone {
     //GC algorithms data will come here
 }
 
-
 impl MapperZone {
     pub fn new(zslba: u64, zone_cap: u64) -> Self {
         Self {
@@ -175,6 +172,11 @@ impl MapperZone {
     }
     pub fn is_full (&self) -> bool {
         self.wp == self.zslba + self.zone_cap
+    }
+
+    pub fn reset(&mut self) {
+        self.wp = self.zslba;
+        self.invalid_blocks = 0;
     }
 }
 
@@ -261,7 +263,7 @@ impl ZNSTarget {
             let backing_zone_zslba: u64 = backing_zone * self.zns_info.zone_size;
             let zone_boundary = backing_zone_zslba + self.zns_info.zone_size;
 
-            let length: u64 = Ord::min(blocks, zone_boundary - current_lba);
+            let length: u64 = Ord::min(blocks, zone_boundary - backing_block);
             let length_contiguous = self.map.lookup_contiguous_physical(current_lba, length)?;
             
             let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.len());
@@ -326,7 +328,7 @@ impl ZNSTarget {
                         self.full_zones.push(full_zone.unwrap());
                     },
                     None => {
-                        return Err("Despite reclaiming, no free zones available. Most likely full.".into());
+                        self.full_zones.push(self.current_zone.take().unwrap());
                     }
                 }
             }
@@ -336,25 +338,23 @@ impl ZNSTarget {
 
     fn reclaim(&mut self) -> Result<(), Box<dyn Error>> {
         
-        let mut reclaimable_zones : Vec<&MapperZone> = self.full_zones.iter()
-            .filter(|z| z.invalid_blocks > 0)
-            .collect();
-        reclaimable_zones.sort_by(|a, b| a.invalid_blocks.cmp(&b.invalid_blocks));
+        self.full_zones.sort_by(|a, b| a.invalid_blocks.cmp(&b.invalid_blocks));
         
-        if reclaimable_zones.is_empty() {
-            return Ok(());
-        }
         if self.op_zones.is_empty() && self.free_zones.is_empty() {
             return Err("No free zones to reclaim to".into());
         }
 
-        let op_zone = if self.op_zones.is_empty() {
+        let mut op_zone = if self.op_zones.is_empty() {
             //TODO I should probably think about this means and when it can happen
             self.free_zones.pop().unwrap()
         } else {
             self.op_zones.pop().unwrap()
         };
-        let victim = self.full_zones.pop().unwrap(); //This should be an entire method depending on the victim selection method
+
+        let mut victim = self.full_zones.pop().unwrap(); //This should be an entire method depending on the victim selection method
+        if victim.invalid_blocks == 0 {
+            return Ok(());
+        }
 
         // Copy the valid data from the victim to the op zone
         let mut victim_block = victim.zslba;
@@ -364,13 +364,25 @@ impl ZNSTarget {
                 let invalid_len = self.map.lookup_contiguous_invalid(victim_block, victim.zone_cap);
                 victim_block += invalid_len;
             }
-            //append valid_len blocks from victim to op_zone
+            else {
+                // Append valid_len blocks from victim to op_zone and update wp
+                // Note: this is making the assumptions that all zones have the same capacity
+                let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
+                let mut data = vec![0u8; (valid_len * block_size) as usize];
+                self.backing.read_copied(&mut data, victim_block)?;
+                self.backing.append_io(1, op_zone.zslba, &data)?;
+                assert!(op_zone.wp == op_zone.zslba);
+                op_zone.incr_wp(valid_len)?;
+                victim_block += valid_len;
+            }
         }
-        // Remap the valid data from the victim to the op zone
+
         self.map.remap(victim.zslba, op_zone.zslba, victim.zone_cap);
+
         // The victim block is now free and can be reset and added to the overprovisioning zones.
         // and The overprovisioning zone can now be used as a free zone
         self.backing.zone_action(1, victim.zslba, false, ZnsZsa::ResetZone)?;
+        victim.reset();
         self.op_zones.push(victim);
         self.free_zones.push(op_zone);
         
