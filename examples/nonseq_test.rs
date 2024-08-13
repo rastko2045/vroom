@@ -8,6 +8,7 @@ use vroom::{NvmeDevice, QUEUE_LENGTH};
 use vroom::nonseq::ZNSTarget;
 
 pub fn main() -> Result<(), Box<dyn Error>> {
+
     let mut args = env::args();
     args.next();
 
@@ -19,11 +20,25 @@ pub fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    let duration = match args.next() {
+        Some(secs) => Some(Duration::from_secs(secs.parse().expect(
+            "Usage: cargo run --example init <pci bus id> <duration in seconds>",
+        ))),
+        None => None,
+    };
+
     let nvme = vroom::init(&pci_addr)?;
     let mut znstarget = vroom::nonseq::ZNSTarget::init(0.3, nvme)?;
 
     znstarget.backing.zone_action(1, 0, true, vroom::ZnsZsa::ResetZone)?;
 
+    qd1(znstarget, 1, true, true, duration)?;
+
+    Ok(())
+
+}
+
+pub fn test(mut znstarget: ZNSTarget) -> Result<(), Box<dyn Error>> {
 
     const N_BLOCKS : usize = 15872;
     let src1 = vec!('a' as u8; N_BLOCKS);
@@ -48,13 +63,16 @@ fn qd1(
     write: bool,
     random: bool,
     time: Option<Duration>,
-) -> Result<NvmeDevice, Box<dyn Error>> {
+) -> Result<ZNSTarget, Box<dyn Error>> {
     let mut buffer: Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE)?;
+
+    const N_BLOCKS : u64 = 15782 * 40;
 
     let ns = nvme.backing.namespaces.get(&1).unwrap();
     let blocks = 8; // Blocks that will be read/written at a time
     let bytes = blocks * ns.block_size;
-    let ns_blocks = ns.blocks / blocks - 1; // - blocks - 1;
+    //let ns_blocks = ns.blocks / blocks - 1; // - blocks - 1;
+    let ns_blocks = N_BLOCKS;
 
     let mut rng = thread_rng();
     let seq = if random {

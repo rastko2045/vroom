@@ -17,8 +17,8 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     //nvme.write_copied("hello world".as_bytes(), 0)?;
     nvme.zone_action(1, 0, false, vroom::ZnsZsa::ResetZone)?;
 
-    nvme.append_io(1, 0, "hello world".as_bytes())?;
-    nvme.append_io(1, 0, "hello world".as_bytes())?;
+    nvme.append_io_copied(1, 0, "hello world".as_bytes())?;
+    nvme.append_io_copied(1, 0, "hello world".as_bytes())?;
 
     let mut dest = [0u8; 12];
     nvme.read_copied(&mut dest, 0)?;

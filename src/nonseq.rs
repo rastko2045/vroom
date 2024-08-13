@@ -1,4 +1,5 @@
 use crate::{NvmeDevice, NvmeZNSInfo, ZnsZsa};
+use crate::memory::{Dma, DmaSlice};
 use std::error::Error;
 
 const ZNS_MAP_UNMAPPED: u64 = 0xFFFFFFFFFFFFFFFF;
@@ -9,7 +10,7 @@ pub struct ZNSMap {
     d2l: Vec<u64>, //Device to logical mapping, needed when copying zones for reclaiming
     invalid_bitmap: Vec<bool> //True means invalid
     // TODO will probably need a mutex for thread safety
-
+    
 }
 
 impl ZNSMap {
@@ -241,6 +242,45 @@ impl ZNSTarget {
         Ok(dev)
     }
 
+    pub fn read(&mut self, dest: &Dma<u8>, lba: u64) -> Result<(), Box<dyn Error>> {
+        
+        let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
+        let mut blocks = (dest.size as u64 + block_size - 1) / block_size;
+        let mut current_lba = lba;
+        let mut current_array = dest;
+        let mut rest;
+
+        if(lba + blocks as u64) > self.max_lba {
+            return Err("Read out of bounds".into());
+        }
+
+        while blocks > 0 {
+            let backing_block = self.map.lookup(current_lba);
+            if backing_block == ZNS_MAP_UNMAPPED {
+                return Err("Block not mapped".into());
+            }
+
+            // Find the zslba of the backing block
+            let backing_zone = backing_block / self.zns_info.zone_size;
+            let backing_zone_zslba: u64 = backing_zone * self.zns_info.zone_size;
+            let zone_boundary = backing_zone_zslba + self.zns_info.zone_size;
+
+            let length: u64 = Ord::min(blocks, zone_boundary - backing_block);
+            let length_contiguous = self.map.lookup_contiguous_physical(current_lba, length)?;
+            
+            let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.size);
+
+            self.backing.read(&current_array.slice(0..split_index), backing_block)?;
+
+            rest = current_array.slice(split_index..current_array.size);
+            current_array = &rest;
+            blocks -= length_contiguous;
+            current_lba += length_contiguous;
+        }
+
+        Ok(())
+    }
+
     pub fn read_copied(&mut self, dest: &mut [u8], lba: u64) -> Result<(), Box<dyn Error>> {
 
         let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
@@ -278,6 +318,67 @@ impl ZNSTarget {
         Ok(())
     }
 
+    pub fn write(&mut self, data: &Dma<u8>, lba: u64) -> Result<(), Box<dyn Error>> {
+
+        let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
+        let mut blocks = (data.size as u64 + block_size - 1) / block_size;
+        let mut current_lba = lba;
+        let mut current_array = data;
+        let mut rest;
+
+        if (lba + blocks as u64) > self.max_lba {
+            return Err("Write out of bounds".into());
+        }
+
+        while blocks > 0 {
+
+            let current_zone = match &mut self.current_zone {
+                Some(current_zone) => current_zone,
+                None => return Err("Ran out of space!".into())
+            };
+
+            let zone_boundary = current_zone.zslba + current_zone.zone_cap;
+            let backing_block = self.map.lookup(current_lba);
+
+            let length = Ord::min(blocks, zone_boundary - current_zone.wp);
+            let length_contiguous = self.map.lookup_contiguous_map(current_lba, length);
+
+            let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.size);
+
+            let d_lba = self.backing.append_io(1, current_zone.zslba, &current_array.slice(0..split_index))?;
+
+            rest = current_array.slice(split_index..current_array.size);
+            current_array = &rest;
+            self.map.update_len(current_lba, d_lba, length_contiguous as u64);
+            current_zone.incr_wp(length_contiguous)?;
+
+            if backing_block != ZNS_MAP_UNMAPPED {
+                self.map.mark_invalid_len(backing_block, length_contiguous);
+                current_zone.invalid_blocks += length_contiguous;
+                assert!(self.map.count_mapped(current_lba, length_contiguous) == length_contiguous);
+            }
+
+            blocks -= length_contiguous;
+            current_lba += length_contiguous;
+
+            if current_zone.is_full() {
+                if self.free_zones.is_empty() {
+                    self.reclaim()?;
+                }
+                match self.free_zones.pop() {
+                    Some(zone) => {
+                        let full_zone = std::mem::replace(&mut self.current_zone, Some(zone));
+                        self.full_zones.push(full_zone.unwrap());
+                    },
+                    None => {
+                        self.full_zones.push(self.current_zone.take().unwrap());
+                    }
+                }
+            }
+        }
+        return Ok(())
+    }
+
     pub fn write_copied(&mut self, data: &[u8],  lba: u64) -> Result<(), Box<dyn Error>> {
 
         let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
@@ -305,7 +406,7 @@ impl ZNSTarget {
             let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.len());
             let (first, rest) = current_array.split_at(split_index);
             current_array = rest;
-            let d_lba = self.backing.append_io(1, current_zone.zslba, first)?;
+            let d_lba = self.backing.append_io_copied(1, current_zone.zslba, first)?;
             self.map.update_len(current_lba, d_lba, length_contiguous as u64);
             current_zone.incr_wp(length_contiguous)?;
 
@@ -367,10 +468,11 @@ impl ZNSTarget {
             else {
                 // Append valid_len blocks from victim to op_zone and update wp
                 // Note: this is making the assumptions that all zones have the same capacity
+                // TODO replace with copy
                 let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
                 let mut data = vec![0u8; (valid_len * block_size) as usize];
                 self.backing.read_copied(&mut data, victim_block)?;
-                self.backing.append_io(1, op_zone.zslba, &data)?;
+                self.backing.append_io_copied(1, op_zone.zslba, &data)?;
                 assert!(op_zone.wp == op_zone.zslba);
                 op_zone.incr_wp(valid_len)?;
                 victim_block += valid_len;

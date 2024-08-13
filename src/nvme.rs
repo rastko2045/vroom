@@ -856,8 +856,31 @@ impl NvmeDevice {
         Ok(())
     }
 
-    // TODO: find out ZASL, most likely 32 * 4096
     pub fn append_io(
+        &mut self,
+        ns_id: u32,
+        slba: u64,
+        data: &impl DmaSlice
+    ) -> Result<u64, Box<dyn Error>> {
+        let ns = *self.namespaces.get(&1).unwrap();
+        let mut is_first = true;
+        let mut result = 0;
+        for chunk in data.chunks(2 * 4096) {
+            let blocks = (chunk.slice.len() as u64 + ns.block_size - 1) / ns.block_size;
+            if is_first {
+                result = self.zone_append(ns_id, slba, blocks as u16, chunk.phys_addr as u64)?;
+                is_first = false;
+            }
+            else {
+                self.zone_append(ns_id, slba, blocks as u16, chunk.phys_addr as u64)?;
+            }
+        }
+
+        Ok(result)
+    }
+
+    // TODO: find out ZASL, most likely 32 * 4096
+    pub fn append_io_copied(
         &mut self,
         ns_id: u32,
         slba: u64,
@@ -870,11 +893,11 @@ impl NvmeDevice {
             self.buffer[..chunk.len()].copy_from_slice(chunk);
             let blocks = (chunk.len() as u64 + ns.block_size - 1) / ns.block_size;
             if is_first {
-                result = self.zone_append(ns_id, slba, blocks as u16)?;
+                result = self.zone_append(ns_id, slba, blocks as u16, self.buffer.phys as u64)?;
                 is_first = false;
             }
             else {
-                self.zone_append(ns_id, slba, blocks as u16)?;
+                self.zone_append(ns_id, slba, blocks as u16, self.buffer.phys as u64)?;
             }
         }
 
@@ -885,15 +908,15 @@ impl NvmeDevice {
         &mut self,
         ns_id: u32,
         slba: u64,
-        n_blocks: u16
+        n_blocks: u16,
+        addr: u64
     ) -> Result<u64, Box<dyn Error>> {
         
         let ns = *self.namespaces.get(&ns_id).unwrap();
         let bytes = (n_blocks as u64) * ns.block_size;
-        let ptr0 = self.buffer.phys as u64;
         let ptr1 = self.get_prp2(bytes);
 
-        let entry = NvmeCommand::zone_append(self.io_sq.tail as u16, ns_id, slba, n_blocks - 1, ptr0, ptr1);
+        let entry = NvmeCommand::zone_append(self.io_sq.tail as u16, ns_id, slba, n_blocks - 1, addr, ptr1);
         let q_id = 1;    
 		let tail = self.io_sq.submit(entry);
         self.stats.submissions += 1;
@@ -968,7 +991,6 @@ impl NvmeDevice {
 	}
 
     
-
     /// Gets PRP2 value depending on the size of the data to be transferred
     fn get_prp2(&self, bytes : u64) -> u64 {
         if bytes <= 4096 {

@@ -54,6 +54,7 @@ impl<T> DerefMut for Dma<T> {
 }
 
 // Trait for types that can be viewed as DMA slices
+// TODO this is nonsense tbh
 pub trait DmaSlice {
     type Item;
 
