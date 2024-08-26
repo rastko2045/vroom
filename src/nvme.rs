@@ -93,6 +93,18 @@ struct IdentifyNamespaceData {
     vendor_specific: [u8; 3712],
 }
 
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+#[allow(unused)]
+// Used for the copy command, experimental, only supports 1 source range (TODO)
+pub struct SourceRangeEntriesDescriptorFormat0 {
+    _reserved1: u64,
+    slba: u64,
+    n_blocks: u16,
+    _reserved2: u16,
+    rest: [u8; 4076]
+}
+
 pub struct NvmeQueuePair {
     pub id: u16,
     pub sub_queue: NvmeSubQueue,
@@ -105,7 +117,7 @@ impl NvmeQueuePair {
         let mut reqs = 0;
         // TODO: contruct PRP list?
         for chunk in data.chunks(2 * 4096) {
-            let blocks = (chunk.slice.len() as u64 + 512 - 1) / 512;
+            let blocks = (chunk.slice.len() as u64 + 512 - 1) / 512; // No??
 
             let addr = chunk.phys_addr as u64;
             let bytes = blocks * 512;
@@ -148,6 +160,51 @@ impl NvmeQueuePair {
             reqs += 1;
         }
         reqs
+    }
+
+    pub fn append_io(&mut self, data: &impl DmaSlice, zslba: u64, block_size: u64) {
+
+        for chunk in data.chunks(2 * 4096) {
+            let blocks = (chunk.slice.len() as u64 + block_size - 1) / block_size;
+
+            let addr = chunk.phys_addr as u64;
+            let bytes = blocks * block_size;
+            let ptr1 = if bytes <= 4096 {
+                0
+            } else {
+                addr + 4096 // self.page_size
+            };
+            let entry = NvmeCommand::zone_append(
+                self.id << 11 | self.sub_queue.tail as u16,
+                1, 
+                zslba, 
+                blocks as u16 - 1, 
+                addr, 
+                ptr1);
+            
+            if let Some(tail) = self.sub_queue.submit_checked(entry) {
+                unsafe {
+                    std::ptr::write_volatile(self.sub_queue.doorbell as *mut u32, tail as u32);
+                }
+            } else {
+                eprintln!("queue full");
+                return;
+            }
+        }
+    }
+
+    pub fn zone_action(&mut self, zslba: u64, za: ZnsZsa) {
+		let entry = NvmeCommand::zone_management_send(
+            self.id << 11 | self.sub_queue.tail as u16,
+            1, 
+            zslba, 
+            false, 
+            za as u8,
+            0);        
+        let tail = self.sub_queue.submit_checked(entry).unwrap();
+        unsafe {
+            std::ptr::write_volatile(self.sub_queue.doorbell as *mut u32, tail as u32);
+        }
     }
 
     // TODO: maybe return result
@@ -620,7 +677,7 @@ impl NvmeDevice {
         self.io_sq.submit_checked(entry)
     }
 
-    fn complete_io(&mut self, step: u64) -> Option<NvmeCompletion> {
+    fn complete_io(&mut self, step: u64) -> Result<NvmeCompletion, NvmeCompletion> {
         let q_id = 1;
 
         let (tail, c_entry, _) = self.io_cq.complete_n(step as usize);
@@ -635,10 +692,10 @@ impl NvmeDevice {
                 (status >> 8) & 0x7
             );
             eprintln!("{:?}", c_entry);
-            return None;
+            return Err(c_entry);
         }
         self.stats.completions += 1;
-        Some(c_entry)
+        Ok(c_entry)
     }
 
     pub fn batched_write(
@@ -797,6 +854,27 @@ impl NvmeDevice {
         self.submit_and_complete_admin(|c_id, _| NvmeCommand::format_nvm(c_id, ns_id));
     }
 
+    pub fn copy(&mut self, ns_id: u32, src: u64, dest: u64, len: u64) -> Result<(), Box<dyn Error>> {
+
+        let mut data = self.buffer.virt as *mut SourceRangeEntriesDescriptorFormat0;
+        unsafe {
+            (*data).slba = src;
+            (*data).n_blocks = len as u16;
+            //TODO is this necessary?
+            (*data)._reserved1 = 0;
+            (*data)._reserved2 = 0;
+            (*data).rest = [0; 4076];
+        }
+        let ptr0 = self.buffer.phys as u64;
+
+        let entry = NvmeCommand::copy(self.io_sq.tail as u16, 1, dest, ptr0);
+        let tail = self.io_sq.submit(entry);
+        self.write_reg_idx(NvmeArrayRegs::SQyTDBL, 1, tail as u32);
+        self.io_sq.head = self.complete_io(1).unwrap().sq_head as usize;
+
+        Ok(())
+    }
+
     // ZNS specific commands
 
     // Zone Report Data Structure
@@ -922,11 +1000,21 @@ impl NvmeDevice {
         self.stats.submissions += 1;
 		self.write_reg_idx(NvmeArrayRegs::SQyTDBL, q_id as u16, tail as u32);
 
-        let completion_entry = self.complete_io(1).unwrap();
-		self.io_sq.head = completion_entry.sq_head as usize;
-        
-        let result = (completion_entry.command_specific2 as u64) << 32 | completion_entry.command_specific1 as u64;
-        Ok(result)
+        match self.complete_io(1) {
+            Ok(completion_entry) => {
+                self.io_sq.head = completion_entry.sq_head as usize;
+                let result = (completion_entry.command_specific2 as u64) << 32 | completion_entry.command_specific1 as u64;
+                Ok(result)
+            }
+            Err(completion_entry) => match completion_entry.status & 0xFF {
+                0xb9 => {
+                    Err("Zone is full".into())
+                }
+                _ => {
+                    Err("Zone append failed for some other reason".into())
+                }
+            }
+        }
     }
 
     pub fn zns_zone_mgmt_rcv(

@@ -6,6 +6,7 @@ use std::{env, process, thread};
 use vroom::memory::*;
 use vroom::{NvmeDevice, QUEUE_LENGTH};
 use vroom::nonseq::ZNSTarget;
+use vroom::nonseq::VictimSelectionMethod;
 
 pub fn main() -> Result<(), Box<dyn Error>> {
 
@@ -28,7 +29,7 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let nvme = vroom::init(&pci_addr)?;
-    let mut znstarget = vroom::nonseq::ZNSTarget::init(0.3, nvme)?;
+    let mut znstarget = vroom::nonseq::ZNSTarget::init(0.3, nvme, VictimSelectionMethod::InvalidBlocks)?;
 
     znstarget.backing.zone_action(1, 0, true, vroom::ZnsZsa::ResetZone)?;
 
@@ -56,6 +57,13 @@ pub fn test(mut znstarget: ZNSTarget) -> Result<(), Box<dyn Error>> {
     println!("{}", std::str::from_utf8(&dest)?);
     Ok(())
 }
+
+// pub fn test_concurrent(nvme : NvmeDevice) -> Result<(), Box<dyn Error>> {
+//     let znstarget = Arc::new(vroom::nonseq::ZNSTarget::init(0.3, nvme, VictimSelectionMethod::InvalidBlocks)?);
+//     let mut threads: Vec<thread::JoinHandle<(u64, f64)>> = Vec::new();
+    
+//     Ok(())
+// }
 
 fn qd1(
     mut nvme: ZNSTarget,
