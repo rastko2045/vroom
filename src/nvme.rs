@@ -111,16 +111,19 @@ pub struct NvmeQueuePair {
     comp_queue: NvmeCompQueue,
 }
 
+unsafe impl Send for NvmeQueuePair {}
+unsafe impl Sync for NvmeQueuePair {}
+
 impl NvmeQueuePair {
     /// returns amount of requests pushed into submission queue
-    pub fn submit_io(&mut self, data: &impl DmaSlice, mut lba: u64, write: bool) -> usize {
+    pub fn submit_io(&mut self, ns_id: u32, block_size: u64, data: &impl DmaSlice, mut lba: u64, write: bool) -> usize {
         let mut reqs = 0;
         // TODO: contruct PRP list?
         for chunk in data.chunks(2 * 4096) {
-            let blocks = (chunk.slice.len() as u64 + 512 - 1) / 512; // No??
+            let blocks = (chunk.slice.len() as u64 + block_size - 1) / block_size; // No??
 
             let addr = chunk.phys_addr as u64;
-            let bytes = blocks * 512;
+            let bytes = blocks * block_size;
             let ptr1 = if bytes <= 4096 {
                 0
             } else {
@@ -130,7 +133,7 @@ impl NvmeQueuePair {
             let entry = if write {
                 NvmeCommand::io_write(
                     self.id << 11 | self.sub_queue.tail as u16,
-                    1,
+                    ns_id,
                     lba,
                     blocks as u16 - 1,
                     addr,
@@ -139,7 +142,7 @@ impl NvmeQueuePair {
             } else {
                 NvmeCommand::io_read(
                     self.id << 11 | self.sub_queue.tail as u16,
-                    1,
+                    ns_id,
                     lba,
                     blocks as u16 - 1,
                     addr,
@@ -162,7 +165,7 @@ impl NvmeQueuePair {
         reqs
     }
 
-    pub fn append_io(&mut self, data: &impl DmaSlice, zslba: u64, block_size: u64) {
+    pub fn append_io(&mut self, ns_id: u32, block_size: u64, data: &impl DmaSlice, zslba: u64) {
 
         for chunk in data.chunks(2 * 4096) {
             let blocks = (chunk.slice.len() as u64 + block_size - 1) / block_size;
@@ -176,7 +179,7 @@ impl NvmeQueuePair {
             };
             let entry = NvmeCommand::zone_append(
                 self.id << 11 | self.sub_queue.tail as u16,
-                1, 
+                ns_id, 
                 zslba, 
                 blocks as u16 - 1, 
                 addr, 
@@ -193,10 +196,10 @@ impl NvmeQueuePair {
         }
     }
 
-    pub fn zone_action(&mut self, zslba: u64, za: ZnsZsa) {
+    pub fn zone_action(&mut self, ns_id: u32, zslba: u64, za: ZnsZsa) {
 		let entry = NvmeCommand::zone_management_send(
             self.id << 11 | self.sub_queue.tail as u16,
-            1, 
+            ns_id, 
             zslba, 
             false, 
             za as u8,
@@ -591,34 +594,47 @@ impl NvmeDevice {
         self.namespaces.get_mut(&id).unwrap().zns_info = Some(zns_info);
     }
 
-    // TODO: currently namespace 1 is hardcoded
-    pub fn write(&mut self, data: &impl DmaSlice, mut lba: u64) -> Result<(), Box<dyn Error>> {
-        let ns = *self.namespaces.get(&1).unwrap();
+    pub fn write(
+        &mut self, 
+        ns_id: u32,
+        data: &impl DmaSlice, 
+        mut lba: u64) -> Result<(), Box<dyn Error>> {
+        let ns = *self.namespaces.get(&ns_id).unwrap();
         for chunk in data.chunks(2 * 4096) {
             let blocks = (chunk.slice.len() as u64 + ns.block_size - 1) / ns.block_size;
-            self.namespace_io(1, blocks, lba, chunk.phys_addr as u64, true)?;
+            self.namespace_io(ns_id, blocks, lba, chunk.phys_addr as u64, true)?;
             lba += blocks;
         }
 
         Ok(())
     }
 
-    pub fn read(&mut self, dest: &impl DmaSlice, mut lba: u64) -> Result<(), Box<dyn Error>> {
-        let ns = *self.namespaces.get(&1).unwrap();
+    pub fn read(
+        &mut self, 
+        ns_id: u32,
+        dest: &impl DmaSlice, 
+        mut lba: u64
+    ) -> Result<(), Box<dyn Error>> {
+        let ns = *self.namespaces.get(&ns_id).unwrap();
         for chunk in dest.chunks(2 * 4096) {
             let blocks = (chunk.slice.len() as u64 + ns.block_size - 1) / ns.block_size;
-            self.namespace_io(1, blocks, lba, chunk.phys_addr as u64, false)?;
+            self.namespace_io(ns_id, blocks, lba, chunk.phys_addr as u64, false)?;
             lba += blocks;
         }
         Ok(())
     }
 
-    pub fn write_copied(&mut self, data: &[u8], mut lba: u64) -> Result<(), Box<dyn Error>> {
-        let ns = *self.namespaces.get(&1).unwrap();
+    pub fn write_copied(
+        &mut self, 
+        ns_id: u32, 
+        data: &[u8], 
+        mut lba: u64
+    ) -> Result<(), Box<dyn Error>> {
+        let ns = *self.namespaces.get(&ns_id).unwrap();
         for chunk in data.chunks(128 * 4096) {
             self.buffer[..chunk.len()].copy_from_slice(chunk);
             let blocks = (chunk.len() as u64 + ns.block_size - 1) / ns.block_size;
-            self.namespace_io(1, blocks, lba, self.buffer.phys as u64, true)?;
+            self.namespace_io(ns_id, blocks, lba, self.buffer.phys as u64, true)?;
             lba += blocks;
         }
 
@@ -627,13 +643,14 @@ impl NvmeDevice {
 
     pub fn read_copied(
         &mut self,
+        ns_id: u32,
         dest: &mut [u8],
         mut lba: u64,
     ) -> Result<(), Box<dyn Error>> {
-        let ns = *self.namespaces.get(&1).unwrap();
+        let ns = *self.namespaces.get(&ns_id).unwrap();
         for chunk in dest.chunks_mut(128 * 4096) {
             let blocks = (chunk.len() as u64 + ns.block_size - 1) / ns.block_size;
-            self.namespace_io(1, blocks, lba, self.buffer.phys as u64, false)?;
+            self.namespace_io(ns_id, blocks, lba, self.buffer.phys as u64, false)?;
             lba += blocks;
             chunk.copy_from_slice(&self.buffer[..chunk.len()]);
         }
@@ -940,7 +957,7 @@ impl NvmeDevice {
         slba: u64,
         data: &impl DmaSlice
     ) -> Result<u64, Box<dyn Error>> {
-        let ns = *self.namespaces.get(&1).unwrap();
+        let ns = *self.namespaces.get(&ns_id).unwrap();
         let mut is_first = true;
         let mut result = 0;
         for chunk in data.chunks(2 * 4096) {
@@ -964,7 +981,7 @@ impl NvmeDevice {
         slba: u64,
         data: &[u8]
     ) -> Result<u64, Box<dyn Error>> {
-        let ns = *self.namespaces.get(&1).unwrap();
+        let ns = *self.namespaces.get(&ns_id).unwrap();
         let mut is_first = true;
         let mut result = 0;
         for chunk in data.chunks(32 * 4096) {

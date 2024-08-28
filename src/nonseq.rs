@@ -221,6 +221,8 @@ pub struct ZNSTarget {
     pub backing: NvmeDevice, //Backing ZNS device
     max_lba: u64, //Last exposed lba (that can be written into)
     exposed_zones: u64,
+    ns_id: u32,
+    block_size: u64,
     zns_info: NvmeZNSInfo, 
     map: Mutex<ZNSMap>,
     victim_selection_method: VictimSelectionMethod,
@@ -236,11 +238,12 @@ unsafe impl Sync for ZNSTarget {}
 
 impl ZNSTarget {
 
-    pub fn init(op_rate: f32, mut backing: NvmeDevice, victim_selection_method: VictimSelectionMethod) -> Result<Self, Box<dyn Error>> {
+    pub fn init(mut backing: NvmeDevice, ns_id: u32, op_rate: f32, victim_selection_method: VictimSelectionMethod) -> Result<Self, Box<dyn Error>> {
         if op_rate >= 1. || op_rate < 0. {
             return Err("Invalid overprovisioning rate".into())
         }
-        let ns = backing.namespaces.get(&1).unwrap();
+        let ns: &crate::NvmeNamespace = backing.namespaces.get(&ns_id).unwrap();
+        let block_size = ns.block_size;
         let zns_info = match ns.zns_info {
             Some(info) => info,
             None => return Err("Not a ZNS device".into())
@@ -248,7 +251,7 @@ impl ZNSTarget {
         let exposed_zones = ((zns_info.n_zones as f32) * (1.0 - op_rate)) as u64;
         let exposed_blocks = exposed_zones * zns_info.zone_size;
         let total_blocks = ns.blocks;
-        let zone_descriptors = backing.get_zone_descriptors(1)?;
+        let zone_descriptors = backing.get_zone_descriptors(ns_id)?;
 
         let mut free_zones = Vec::new();
         for i in 0..exposed_zones {
@@ -281,6 +284,8 @@ impl ZNSTarget {
             backing,
             max_lba: exposed_blocks - 1,
             exposed_zones,
+            ns_id,
+            block_size,
             zns_info,
             map: Mutex::new(ZNSMap::init(exposed_blocks as usize, total_blocks as usize)),
             victim_selection_method,
@@ -297,10 +302,10 @@ impl ZNSTarget {
         Ok(dev)
     }
 
+    // TODO on this and the rest, bypass mutexes with into_inner since it's meant for single threaded use
     pub fn read(&mut self, dest: &Dma<u8>, lba: u64) -> Result<(), Box<dyn Error>> {
 
-        let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
-        let mut blocks = (dest.size as u64 + block_size - 1) / block_size;
+        let mut blocks = (dest.size as u64 + self.block_size - 1) / self.block_size;
         let mut current_lba = lba;
         let mut current_array = dest;
         let mut rest;
@@ -317,15 +322,15 @@ impl ZNSTarget {
 
             // Find the zslba of the backing block
             let zslba: u64 = (backing_block / self.zns_info.zone_size) * self.zns_info.zone_size;
-            let zone_boundary = zslba + self.zns_info.zone_size;
+            let zone_boundary: u64 = zslba + self.zns_info.zone_size;
             match self.reclaim_locks[self.get_zone_number(zslba)].try_read() {
                 Ok(_lock) => {
                     let length: u64 = Ord::min(blocks, zone_boundary - backing_block);
                     let length_contiguous = self.map.lock().unwrap().lookup_contiguous_physical(current_lba, length)?;
                     
-                    let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.size);
+                    let split_index = Ord::min((length_contiguous * self.block_size) as usize, current_array.size);
 
-                    self.backing.read(&mut current_array.slice(0..split_index), backing_block)?;
+                    self.backing.read(self.ns_id, &mut current_array.slice(0..split_index), backing_block)?;
 
                     rest = current_array.slice(split_index..current_array.size);
                     current_array = &rest;
@@ -344,8 +349,7 @@ impl ZNSTarget {
 
     pub fn read_copied(&mut self, dest: &mut [u8], lba: u64) -> Result<(), Box<dyn Error>> {
 
-        let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
-        let mut blocks = (dest.len() as u64 + block_size - 1) / block_size;
+        let mut blocks = (dest.len() as u64 + self.block_size - 1) / self.block_size;
         let mut current_lba = lba;
         let mut current_array = dest;
 
@@ -367,11 +371,11 @@ impl ZNSTarget {
                     let length: u64 = Ord::min(blocks, zone_boundary - backing_block);
                     let length_contiguous = self.map.lock().unwrap().lookup_contiguous_physical(current_lba, length)?;
                     
-                    let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.len());
+                    let split_index = Ord::min((length_contiguous * self.block_size) as usize, current_array.len());
                     let (first, rest) = current_array.split_at_mut(split_index);
                     current_array = rest;
         
-                    self.backing.read_copied(first, backing_block)?;
+                    self.backing.read_copied(self.ns_id, first, backing_block)?;
                     blocks -= length_contiguous;
                     current_lba += length_contiguous;
                 },
@@ -387,8 +391,7 @@ impl ZNSTarget {
 
     pub fn write(&mut self, data: &Dma<u8>, lba: u64) -> Result<(), Box<dyn Error>> {
 
-        let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
-        let mut blocks = (data.size as u64 + block_size - 1) / block_size;
+        let mut blocks = (data.size as u64 + self.block_size - 1) / self.block_size;
         let mut current_lba = lba;
         let mut current_array = data;
         let mut rest;
@@ -399,8 +402,12 @@ impl ZNSTarget {
 
         while blocks > 0 {
 
-            // TODO handle failure
-            let mut current_zone = self.zones.lock().unwrap().free_zones.pop().unwrap();
+            let mut current_zone = match self.zones.lock().unwrap().free_zones.pop() {
+                Some(zone) => zone,
+                None => {
+                    return Err("No free zones for write".into());
+                }
+            };
 
             let zone_boundary = current_zone.zslba + current_zone.zone_cap;
 
@@ -411,7 +418,7 @@ impl ZNSTarget {
             let length_contiguous = map.lookup_contiguous_map(current_lba, length);
             drop(map);
 
-            let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.size);
+            let split_index = Ord::min((length_contiguous * self.block_size) as usize, current_array.size);
 
             let d_lba = self.backing.append_io(1, current_zone.zslba, &current_array.slice(0..split_index))?;
 
@@ -447,8 +454,7 @@ impl ZNSTarget {
 
     pub fn write_copied(&mut self, data: &[u8],  lba: u64) -> Result<(), Box<dyn Error>> {
 
-        let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
-        let mut blocks = (data.len() as u64 + block_size - 1) / block_size;
+        let mut blocks = (data.len() as u64 + self.block_size - 1) / self.block_size;
         let mut current_lba = lba;
         let mut current_array = data;
 
@@ -458,8 +464,12 @@ impl ZNSTarget {
 
         while blocks > 0 {
 
-            // TODO handle failure
-            let mut current_zone = self.zones.lock().unwrap().free_zones.pop().unwrap();
+            let mut current_zone = match self.zones.lock().unwrap().free_zones.pop() {
+                Some(zone) => zone,
+                None => {
+                    return Err("No free zones for write".into());
+                }
+            };
 
             let zone_boundary = current_zone.zslba + current_zone.zone_cap;
 
@@ -470,7 +480,7 @@ impl ZNSTarget {
             let length_contiguous = map.lookup_contiguous_map(current_lba, length);
             drop(map);
 
-            let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.len());
+            let split_index = Ord::min((length_contiguous * self.block_size) as usize, current_array.len());
             let (first, rest) = current_array.split_at(split_index);
             current_array = rest;
 
@@ -492,16 +502,14 @@ impl ZNSTarget {
             current_lba += length_contiguous;
 
             if current_zone.is_full() {
-                if self.zones.lock().unwrap().free_zones.is_empty() {
-                    self.reclaim()?;
-                }
-                self.zones.lock().unwrap().full_zones.push(current_zone);
+                let mut zones = self.zones.lock().unwrap();
+                zones.full_zones.push(current_zone);
+                self.reclaim_condition.notify_all();
             }
             else {
                 self.zones.lock().unwrap().free_zones.push(current_zone);
-                }         
-            }
-
+            }         
+        }
         return Ok(())
     }
 
@@ -523,71 +531,7 @@ impl ZNSTarget {
         }
     }
 
-    fn reclaim(&mut self) -> Result<(), Box<dyn Error>> {
-
-        let mut zones = self.zones.lock().unwrap();
-
-        if zones.op_zones.is_empty() && zones.free_zones.is_empty() {
-            return Err("No free zones to reclaim to".into());
-        }
-
-        let mut op_zone = if zones.op_zones.is_empty() {
-            //TODO I should probably think about this means and when it can happen
-            zones.free_zones.pop().unwrap()
-        } else {
-            zones.op_zones.pop().unwrap()
-        };
-
-        drop(zones);
-
-        let mut victim = self.pick_victim()?;
-        let victim_zone_number = self.get_zone_number(victim.zslba);
-        let mut victim_metadata = self.zones_metadata[victim_zone_number].lock().unwrap();
-        
-        if victim_metadata.invalid_blocks == 0 {
-            return Ok(());
-        }
-
-        // Need to lock reads to the victim
-        let _lock = self.reclaim_locks[victim_zone_number].write().unwrap();
-
-        // Copy the valid data from the victim to the op zone
-        let mut victim_block = victim.zslba;
-        while victim_block < victim.zslba + victim.zone_cap {
-            let valid_len = self.map.lock().unwrap().lookup_contiguous_valid(victim_block, victim.zone_cap);
-            if valid_len == 0 {
-                let invalid_len = self.map.lock().unwrap().lookup_contiguous_invalid(victim_block, victim.zone_cap);
-                victim_block += invalid_len;
-            }
-            else {
-                // Append valid_len blocks from victim to op_zone and update wp
-                // Note: this is making the assumptions that all zones have the same capacity
-                // TODO replace with copy
-                let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
-                let mut data = vec![0u8; (valid_len * block_size) as usize];
-                self.backing.read_copied(&mut data, victim_block)?;
-                self.backing.append_io_copied(1, op_zone.zslba, &data)?;
-                assert!(op_zone.wp == op_zone.zslba);
-                op_zone.incr_wp(valid_len)?;
-                victim_block += valid_len;
-            }
-        }
-
-        self.map.lock().unwrap().remap(victim.zslba, op_zone.zslba, victim.zone_cap);
-        self.zones.lock().unwrap().free_zones.push(op_zone);
-        drop(_lock); // Remap is done, we can unlock the victim
-
-        // The victim block is now free and can be reset and added to the overprovisioning zones.
-        // and The overprovisioning zone can now be used as a free zone
-        self.backing.zone_action(1, victim.zslba, false, ZnsZsa::ResetZone)?;
-        victim.reset();
-        victim_metadata.reset();
-        self.zones.lock().unwrap().op_zones.push(victim);
-        
-        Ok(())
-    }
-    
-    fn reclaim_concurrent(&self, nvme_queue_pair: &mut NvmeQueuePair) -> Result<(), Box<dyn Error>> {
+    pub fn reclaim(&self, nvme_queue_pair: &mut NvmeQueuePair) -> Result<(), Box<dyn Error>> {
 
         let mut zones = self
             .reclaim_condition
@@ -634,11 +578,10 @@ impl ZNSTarget {
                 // Append valid_len blocks from victim to op_zone and update wp
                 // Note: this is making the assumptions that all zones have the same capacity
                 // TODO replace with copy
-                let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
-                let mut data : Dma<u8> = Dma::allocate((valid_len * block_size) as usize)?;
-                nvme_queue_pair.submit_io(&mut data, victim_block, false);
+                let mut data : Dma<u8> = Dma::allocate((valid_len * self.block_size) as usize)?;
+                nvme_queue_pair.submit_io(self.ns_id, self.block_size, &mut data, victim_block, false);
                 nvme_queue_pair.complete_io(1);
-                nvme_queue_pair.submit_io(&mut data, op_zone.zslba, true);
+                nvme_queue_pair.submit_io(self.ns_id, self.block_size, &mut data, op_zone.zslba, true);
                 nvme_queue_pair.complete_io(1);
                 assert!(op_zone.wp == op_zone.zslba);
                 op_zone.incr_wp(valid_len)?;
@@ -652,7 +595,7 @@ impl ZNSTarget {
 
         // The victim block is now free and can be reset and added to the overprovisioning zones.
         // and The overprovisioning zone can now be used as a free zone
-        nvme_queue_pair.zone_action(victim.zslba, ZnsZsa::ResetZone);
+        nvme_queue_pair.zone_action(self.ns_id, victim.zslba, ZnsZsa::ResetZone);
         nvme_queue_pair.complete_io(1);
         victim.reset();
         victim_metadata.reset();
@@ -663,8 +606,7 @@ impl ZNSTarget {
 
     pub fn read_concurrent(&self, nvme_queue_pair: &mut NvmeQueuePair, dest: &Dma<u8>, lba: u64) -> Result<(), Box<dyn Error>> {
 
-        let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
-        let mut blocks = (dest.size as u64 + block_size - 1) / block_size;
+        let mut blocks = (dest.size as u64 + self.block_size - 1) / self.block_size;
         let mut current_lba = lba;
         let mut current_array = dest;
         let mut rest;
@@ -687,9 +629,9 @@ impl ZNSTarget {
                     let length: u64 = Ord::min(blocks, zone_boundary - backing_block);
                     let length_contiguous = self.map.lock().unwrap().lookup_contiguous_physical(current_lba, length)?;
                     
-                    let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.size);
+                    let split_index = Ord::min((length_contiguous * self.block_size) as usize, current_array.size);
         
-                    nvme_queue_pair.submit_io(&current_array.slice(0..split_index), backing_block, false);
+                    nvme_queue_pair.submit_io(self.ns_id, self.block_size,&current_array.slice(0..split_index), backing_block, false);
 
                     rest = current_array.slice(split_index..current_array.size);
                     current_array = &rest;
@@ -708,8 +650,7 @@ impl ZNSTarget {
 
     pub fn write_concurrent(&self, nvme_queue_pair: &mut NvmeQueuePair, data: &Dma<u8>, lba: u64) -> Result<(), Box<dyn Error>> {
 
-        let block_size = self.backing.namespaces.get(&1).unwrap().block_size;
-        let mut blocks = (data.size as u64 + block_size - 1) / block_size;
+        let mut blocks = (data.size as u64 + self.block_size - 1) / self.block_size;
         let mut current_lba = lba;
         let mut current_array = data;
         let mut rest;
@@ -720,25 +661,29 @@ impl ZNSTarget {
 
         while blocks > 0 {
 
-            // TODO handle failure
-            let mut current_zone = self.zones.lock().unwrap().free_zones.pop().unwrap();
+            let mut current_zone = match self.zones.lock().unwrap().free_zones.pop() {
+                Some(zone) => zone,
+                None => {
+                    return Err("No free zones for write".into());
+                }
+            };
 
             let zone_boundary = current_zone.zslba + current_zone.zone_cap;
 
             let length = Ord::min(blocks, zone_boundary - current_zone.wp);
 
             let map: std::sync::MutexGuard<ZNSMap> = self.map.lock().unwrap();
-            let backing_block = map.lookup(current_lba);
             let length_contiguous = map.lookup_contiguous_map(current_lba, length);
             drop(map);
 
-            let split_index = Ord::min((length_contiguous * block_size) as usize, current_array.size);
+            let split_index = Ord::min((length_contiguous * self.block_size) as usize, current_array.size);
 
             // Idea ignore d_lba and assume it's the write pointer, should always work out? Worth a try
-            // Otherwise qd > 1 is gonna be impossible :(
-            nvme_queue_pair.append_io(data, current_zone.zslba, block_size);
+            // Otherwise qd > 1 is gonna be impossible :( qd1t1 qd32t1 / qd1t32
+            nvme_queue_pair.append_io(self.ns_id, self.block_size, data, current_zone.zslba);
 
             let mut map = self.map.lock().unwrap();
+            let backing_block = map.lookup(current_lba);
             if backing_block != ZNS_MAP_UNMAPPED {
                 map.mark_invalid_len(backing_block, length_contiguous);
                 let zone_number = self.get_zone_number(current_lba);
@@ -757,19 +702,15 @@ impl ZNSTarget {
             current_array = &rest;
 
             if current_zone.is_full() {
-                let mut zones = self.zones.lock().unwrap();
-                zones.full_zones.push(current_zone);
+                self.zones.lock().unwrap().full_zones.push(current_zone);
                 self.reclaim_condition.notify_all();
             }
             else {
                 self.zones.lock().unwrap().free_zones.push(current_zone);
                 }         
             }
-        return Ok(())
-    }
-
-    fn get_zslba(&self, lba: u64) -> u64 {
-        (lba / self.zns_info.zone_size) * self.zns_info.zone_size
+            
+        Ok(())
     }
 
     fn get_zone_number(&self, lba: u64) -> usize {

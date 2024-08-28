@@ -2,9 +2,9 @@ use std::error::Error;
 use rand::{thread_rng, Rng};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::{env, process, thread};
+use std::{env, process};
 use vroom::memory::*;
-use vroom::{NvmeDevice, QUEUE_LENGTH};
+use vroom::QUEUE_LENGTH;
 use vroom::nonseq::ZNSTarget;
 use vroom::nonseq::VictimSelectionMethod;
 
@@ -29,11 +29,13 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let nvme = vroom::init(&pci_addr)?;
-    let mut znstarget = vroom::nonseq::ZNSTarget::init(0.3, nvme, VictimSelectionMethod::InvalidBlocks)?;
+    let ns_id = 2;
+    let mut znstarget = vroom::nonseq::ZNSTarget::init(nvme, ns_id, 0.3, VictimSelectionMethod::InvalidBlocks)?;
 
     znstarget.backing.zone_action(1, 0, true, vroom::ZnsZsa::ResetZone)?;
 
-    qd1(znstarget, 1, true, true, duration)?;
+    //qd1(znstarget, 1, true, true, duration)?;
+    test_concurrent(znstarget, 2)?;
 
     Ok(())
 
@@ -58,15 +60,69 @@ pub fn test(mut znstarget: ZNSTarget) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// pub fn test_concurrent(nvme : NvmeDevice) -> Result<(), Box<dyn Error>> {
-//     let znstarget = Arc::new(vroom::nonseq::ZNSTarget::init(0.3, nvme, VictimSelectionMethod::InvalidBlocks)?);
-//     let mut threads: Vec<thread::JoinHandle<(u64, f64)>> = Vec::new();
-    
-//     Ok(())
-// }
+pub fn test_concurrent(mut znstarget: ZNSTarget, n_threads: u8) -> Result<(), Box<dyn Error>> {
+
+    let mut queue_pairs = Vec::new();
+
+    for _ in 0..(n_threads + 1) {
+        let qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH)?;
+        queue_pairs.push(qpair);
+    }
+
+    let mut threads = Vec::new();
+
+    let queue_pairs = Arc::new(Mutex::new(queue_pairs));
+
+    let znstarget = Arc::new(znstarget);
+    let znstarget_reclaim = znstarget.clone();
+    let reclaim_queue_pairs = queue_pairs.clone();
+    let reclaim_thread = std::thread::spawn(move || {
+        let mut reclaim_queues = reclaim_queue_pairs.lock().unwrap().pop().unwrap();
+        loop {
+            let _ = znstarget_reclaim.reclaim(&mut reclaim_queues);
+        }
+    });
+
+    for i in 0..(n_threads as u64) {
+        let znstarget = znstarget.clone();
+        let queue_pairs = queue_pairs.clone();
+
+        let handle = std::thread::spawn(move || {
+
+            let range = (i * 1000)..((i + 1) * 1000);
+            let mut rng = thread_rng();
+            let bytes = 4096;
+            let mut buffer: Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE).unwrap();
+
+            let mut qpair = queue_pairs.lock().unwrap().pop().unwrap();
+
+            let rand_block = &(0..(32 * bytes))
+                .map(|_| rand::random::<u8>())
+                .collect::<Vec<_>>()[..];
+            buffer[0..32 * bytes].copy_from_slice(rand_block);
+            let lba = rng.gen_range(range);
+
+            let _ = znstarget.write_concurrent(&mut qpair ,&buffer, lba);
+
+        });
+        threads.push(handle);
+    }
+
+    for handle in threads {
+        handle.join().unwrap();
+    }
+    reclaim_thread.join().unwrap(); // I believe this will be problematic
+
+    let mut znstarget = Arc::try_unwrap(znstarget).unwrap_or_else(|_| panic!("This legit can't happen"));
+
+    znstarget.backing.get_zone_reports(1)?;
+
+    Ok(())
+}
 
 fn qd1(
-    mut nvme: ZNSTarget,
+    mut znstarget: ZNSTarget,
+    ns_id: u32,
     n: u64,
     write: bool,
     random: bool,
@@ -76,11 +132,11 @@ fn qd1(
 
     const N_BLOCKS : u64 = 15782 * 40;
 
-    let ns = nvme.backing.namespaces.get(&1).unwrap();
+    let ns = znstarget.backing.namespaces.get(&ns_id).unwrap();
     let blocks = 8; // Blocks that will be read/written at a time
     let bytes = blocks * ns.block_size;
     //let ns_blocks = ns.blocks / blocks - 1; // - blocks - 1;
-    let ns_blocks = N_BLOCKS;
+    let ns_blocks = N_BLOCKS / blocks - 1;
 
     let mut rng = thread_rng();
     let seq = if random {
@@ -104,9 +160,9 @@ fn qd1(
 
             let before = Instant::now();
             if write {
-                nvme.write(&buffer.slice(0..bytes as usize), lba * blocks)?;
+                znstarget.write(&buffer.slice(0..bytes as usize), lba * blocks)?;
             } else {
-                nvme.read(&buffer.slice(0..bytes as usize), lba * blocks)?;
+                znstarget.read(&buffer.slice(0..bytes as usize), lba * blocks)?;
             }
             let elapsed = before.elapsed();
             total += elapsed;
@@ -121,9 +177,9 @@ fn qd1(
         for lba in seq {
             let before = Instant::now();
             if write {
-                nvme.write(&buffer.slice(0..bytes as usize), lba * blocks)?;
+                znstarget.write(&buffer.slice(0..bytes as usize), lba * blocks)?;
             } else {
-                nvme.read(&buffer.slice(0..bytes as usize), lba * blocks)?;
+                znstarget.read(&buffer.slice(0..bytes as usize), lba * blocks)?;
             }
             total += before.elapsed();
         }
@@ -133,5 +189,5 @@ fn qd1(
             n as f64 / total.as_secs_f64()
         );
     }
-    Ok(nvme)
+    Ok(znstarget)
 }

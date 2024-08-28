@@ -28,16 +28,12 @@ pub fn main() -> Result<(), Box<dyn Error>> {
 
     let mut nvme = vroom::init(&pci_addr)?;
 
-    let nvme = qd_n(nvme, 1, 0, false,  128, duration)?;
-    let _ = qd_n(nvme, 1, 0, false,  256, duration)?;
-
-    // let _ = qd1(nvme, 0, false, true, duration)?;
-
     Ok(())
 }
 
 fn qd1(
     mut nvme: NvmeDevice,
+    ns_id: u32,
     n: u64,
     write: bool,
     random: bool,
@@ -45,7 +41,7 @@ fn qd1(
 ) -> Result<NvmeDevice, Box<dyn Error>> {
     let mut buffer: Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE)?;
 
-    let ns = nvme.namespaces.get(&1).unwrap();
+    let ns = nvme.namespaces.get(&ns_id).unwrap();
     let blocks = 8; // Blocks that will be read/written at a time
     let bytes = blocks * ns.block_size;
     let ns_blocks = ns.blocks / blocks - 1; // - blocks - 1;
@@ -72,9 +68,9 @@ fn qd1(
 
             let before = Instant::now();
             if write {
-                nvme.write(&buffer.slice(0..bytes as usize), lba * blocks)?;
+                nvme.write(ns_id, &buffer.slice(0..bytes as usize), lba * blocks)?;
             } else {
-                nvme.read(&buffer.slice(0..bytes as usize), lba * blocks)?;
+                nvme.read(ns_id, &buffer.slice(0..bytes as usize), lba * blocks)?;
             }
             let elapsed = before.elapsed();
             total += elapsed;
@@ -89,9 +85,9 @@ fn qd1(
         for lba in seq {
             let before = Instant::now();
             if write {
-                nvme.write(&buffer.slice(0..bytes as usize), lba * blocks)?;
+                nvme.write(ns_id, &buffer.slice(0..bytes as usize), lba * blocks)?;
             } else {
-                nvme.read(&buffer.slice(0..bytes as usize), lba * blocks)?;
+                nvme.read(ns_id, &buffer.slice(0..bytes as usize), lba * blocks)?;
             }
             total += before.elapsed();
         }
@@ -107,6 +103,7 @@ fn qd1(
 #[allow(unused)]
 fn qd_n(
     nvme: NvmeDevice,
+    ns_id: u32,
     n_threads: u64,
     n: u64,
     write: bool,
@@ -114,7 +111,8 @@ fn qd_n(
     time: Option<Duration>,
 ) -> Result<NvmeDevice, Box<dyn Error>> {
     let blocks = 8;
-    let ns_blocks = nvme.namespaces.get(&1).unwrap().blocks / blocks;
+    let ns_blocks = nvme.namespaces.get(&ns_id).unwrap().blocks / blocks;
+    let block_size = nvme.namespaces.get(&ns_id).unwrap().block_size;
 
     let nvme = Arc::new(Mutex::new(nvme));
     let mut threads = Vec::new();
@@ -156,6 +154,8 @@ fn qd_n(
                         ios += 1;
                     }
                     qpair.submit_io(
+                        ns_id,
+                        block_size,
                         &buffer.slice((ctr * bytes)..(ctr + 1) * bytes),
                         lba * blocks,
                         write,
@@ -188,6 +188,8 @@ fn qd_n(
                         ctr -= 1;
                     }
                     qpair.submit_io(
+                        ns_id,
+                        block_size,
                         &buffer.slice((ctr * bytes)..(ctr + 1) * bytes),
                         lba * blocks,
                         write,
@@ -236,14 +238,14 @@ fn qd_n(
     }
 }
 
-fn fill_ns(nvme: &mut NvmeDevice) {
+fn fill_ns(nvme: &mut NvmeDevice, ns_id: u32) {
     let buffer: Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE).unwrap();
-    let block_size = nvme.namespaces.get(&1).unwrap().block_size;
-    let max_lba = nvme.namespaces.get(&1).unwrap().blocks - buffer.size as u64 / block_size - 1;
+    let block_size = nvme.namespaces.get(&ns_id).unwrap().block_size;
+    let max_lba = nvme.namespaces.get(&ns_id).unwrap().blocks - buffer.size as u64 / block_size - 1;
     let blocks = buffer.size as u64 / block_size;
     let mut lba = 0;
     while lba < max_lba - block_size {
-        nvme.write(&buffer, lba).unwrap();
+        nvme.write(ns_id, &buffer, lba).unwrap();
         lba += blocks;
     }
 }
