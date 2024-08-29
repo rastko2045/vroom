@@ -587,6 +587,19 @@ impl NvmeDevice {
         let n_zones = ns.blocks / zone_size;
         println!("Namespace {id}, Zone Size: {zone_size}, Number of Zones: {n_zones}");
 
+        // See Figure 48 of the ZNS spec
+        if((zns_data.zoc >> 1) & 1 == 1) {
+            println!("Zones may randomly be marked as full?")
+        }
+        if(zns_data.zoc & 1 == 1) {
+            println!("Zone capacity may change after a reset.")
+        } else {
+            println!("Zone capacity won't change.")
+        }
+        if(zns_data.ozcs & 1 == 1) {
+            println!("Cross zone reads are supported.")
+        }
+
         let zns_info = NvmeZNSInfo {
             zone_size,
             n_zones
@@ -670,7 +683,7 @@ impl NvmeDevice {
         let q_id = 1;
 
         let bytes = blocks * ns.block_size;
-        let ptr1 = self.get_prp2(bytes);
+        let ptr1 = self.get_prp2(bytes, addr);
 
         let entry = if write {
             NvmeCommand::io_write(
@@ -808,7 +821,7 @@ impl NvmeDevice {
         let ns = *self.namespaces.get(&ns_id).unwrap();
 
         let bytes = blocks * ns.block_size;
-        let ptr1 = self.get_prp2(bytes);
+        let ptr1 = self.get_prp2(bytes, addr);
 
         let entry = if write {
             NvmeCommand::io_write(
@@ -1009,7 +1022,7 @@ impl NvmeDevice {
         
         let ns = *self.namespaces.get(&ns_id).unwrap();
         let bytes = (n_blocks as u64) * ns.block_size;
-        let ptr1 = self.get_prp2(bytes);
+        let ptr1 = self.get_prp2(bytes, addr);
 
         let entry = NvmeCommand::zone_append(self.io_sq.tail as u16, ns_id, slba, n_blocks - 1, addr, ptr1);
         let q_id = 1;    
@@ -1046,7 +1059,7 @@ impl NvmeDevice {
 
         let bytes = (n_dwords as u64) * 4;
         let ptr0 = self.buffer.phys as u64;
-        let ptr1 = self.get_prp2(bytes);
+        let ptr1 = self.get_prp2(bytes, self.buffer.phys as u64);
 
 		let entry = NvmeCommand::zone_management_rcv(
             self.io_sq.tail as u16, 
@@ -1097,11 +1110,11 @@ impl NvmeDevice {
 
     
     /// Gets PRP2 value depending on the size of the data to be transferred
-    fn get_prp2(&self, bytes : u64) -> u64 {
+    fn get_prp2(&self, bytes : u64, addr: u64) -> u64 {
         if bytes <= 4096 {
             0
         } else if bytes <= 8192 {
-            self.buffer.phys as u64 + 4096 // self.page_size
+            addr + 4096 // self.page_size
         } else {
             self.prp_list.phys as u64
         }

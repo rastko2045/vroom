@@ -1,6 +1,7 @@
 use crate::{NvmeDevice, NvmeQueuePair, NvmeZNSInfo, ZnsZsa};
 use crate::memory::{Dma, DmaSlice};
 use std::error::Error;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, RwLock, Condvar};
 
 const ZNS_MAP_UNMAPPED: u64 = 0xFFFFFFFFFFFFFFFF;
@@ -229,7 +230,8 @@ pub struct ZNSTarget {
     zones: Mutex<ZNSZones>,
     zones_metadata: Vec<Mutex<MapperZoneMetadata>>,
     reclaim_locks: Vec<RwLock<()>>,
-    reclaim_condition: Condvar
+    reclaim_condition: Condvar,
+    pub end_reclaim: AtomicBool
 }
 
 // TODO
@@ -254,7 +256,7 @@ impl ZNSTarget {
         let zone_descriptors = backing.get_zone_descriptors(ns_id)?;
 
         let mut free_zones = Vec::new();
-        for i in 0..exposed_zones {
+        for i in (0..exposed_zones).rev() {
             let zslba = i * zns_info.zone_size;
             free_zones.push(MapperZone::new(zslba, zone_descriptors[i as usize].zcap));
         }
@@ -296,7 +298,8 @@ impl ZNSTarget {
             }),
             zones_metadata: zone_meta,
             reclaim_locks,
-            reclaim_condition: Condvar::new()
+            reclaim_condition: Condvar::new(),
+            end_reclaim: AtomicBool::new(false)
         };
 
         Ok(dev)
@@ -420,7 +423,7 @@ impl ZNSTarget {
 
             let split_index = Ord::min((length_contiguous * self.block_size) as usize, current_array.size);
 
-            let d_lba = self.backing.append_io(1, current_zone.zslba, &current_array.slice(0..split_index))?;
+            let d_lba = self.backing.append_io(self.ns_id, current_zone.zslba, &current_array.slice(0..split_index))?;
 
             let mut map = self.map.lock().unwrap();
             if backing_block != ZNS_MAP_UNMAPPED {
@@ -484,7 +487,7 @@ impl ZNSTarget {
             let (first, rest) = current_array.split_at(split_index);
             current_array = rest;
 
-            let d_lba = self.backing.append_io_copied(1, current_zone.zslba, first)?;
+            let d_lba = self.backing.append_io_copied(self.ns_id, current_zone.zslba, first)?;
 
             let mut map = self.map.lock().unwrap();
             if backing_block != ZNS_MAP_UNMAPPED {
@@ -536,9 +539,13 @@ impl ZNSTarget {
         let mut zones = self
             .reclaim_condition
             .wait_while(self.zones.lock().unwrap(), |zones| {
-                zones.free_zones.len() > zones.full_zones.len()
+                zones.free_zones.len() > zones.full_zones.len() && !self.end_reclaim.load(std::sync::atomic::Ordering::Relaxed)
             })
             .unwrap();
+
+        if self.end_reclaim.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
 
         if zones.op_zones.is_empty() && zones.free_zones.is_empty() {
             return Err("No free zones to reclaim to".into());
@@ -679,7 +686,7 @@ impl ZNSTarget {
             let split_index = Ord::min((length_contiguous * self.block_size) as usize, current_array.size);
 
             // Idea ignore d_lba and assume it's the write pointer, should always work out? Worth a try
-            // Otherwise qd > 1 is gonna be impossible :( qd1t1 qd32t1 / qd1t32
+            // Otherwise qd > 1 is gonna be impossible :(
             nvme_queue_pair.append_io(self.ns_id, self.block_size, data, current_zone.zslba);
 
             let mut map = self.map.lock().unwrap();
@@ -711,6 +718,11 @@ impl ZNSTarget {
             }
             
         Ok(())
+    }
+
+    pub fn end_reclaim(&self) {
+        self.end_reclaim.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.reclaim_condition.notify_all();
     }
 
     fn get_zone_number(&self, lba: u64) -> usize {

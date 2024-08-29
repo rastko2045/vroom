@@ -32,10 +32,11 @@ pub fn main() -> Result<(), Box<dyn Error>> {
     let ns_id = 2;
     let mut znstarget = vroom::nonseq::ZNSTarget::init(nvme, ns_id, 0.3, VictimSelectionMethod::InvalidBlocks)?;
 
-    znstarget.backing.zone_action(1, 0, true, vroom::ZnsZsa::ResetZone)?;
+    znstarget.backing.zone_action(ns_id, 0, true, vroom::ZnsZsa::ResetZone)?;
 
-    //qd1(znstarget, 1, true, true, duration)?;
-    test_concurrent(znstarget, 2)?;
+    //let znstarget = qd1(znstarget, ns_id, 1, true, false, duration)?;
+    //qd1(znstarget, ns_id, 1, false, false, duration)?;
+    test_concurrent(znstarget, 1)?;
 
     Ok(())
 
@@ -79,6 +80,11 @@ pub fn test_concurrent(mut znstarget: ZNSTarget, n_threads: u8) -> Result<(), Bo
     let reclaim_thread = std::thread::spawn(move || {
         let mut reclaim_queues = reclaim_queue_pairs.lock().unwrap().pop().unwrap();
         loop {
+            let condition = znstarget_reclaim.end_reclaim.load(std::sync::atomic::Ordering::Relaxed);
+            println!("Condition is {}", condition);
+            if condition {
+                break;
+            }
             let _ = znstarget_reclaim.reclaim(&mut reclaim_queues);
         }
     });
@@ -91,19 +97,19 @@ pub fn test_concurrent(mut znstarget: ZNSTarget, n_threads: u8) -> Result<(), Bo
 
             let range = (i * 1000)..((i + 1) * 1000);
             let mut rng = thread_rng();
-            let bytes = 4096;
+            let bytes = 4096 * 16;
             let mut buffer: Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE).unwrap();
 
             let mut qpair = queue_pairs.lock().unwrap().pop().unwrap();
 
-            let rand_block = &(0..(32 * bytes))
+            let rand_block = &(0..(bytes))
                 .map(|_| rand::random::<u8>())
                 .collect::<Vec<_>>()[..];
-            buffer[0..32 * bytes].copy_from_slice(rand_block);
+            buffer[0..bytes].copy_from_slice(rand_block);
             let lba = rng.gen_range(range);
 
-            let _ = znstarget.write_concurrent(&mut qpair ,&buffer, lba);
-
+            let _ = znstarget.write_concurrent(&mut qpair ,&buffer.slice(0..bytes), lba);
+            println!("Thread {} is finished :)", i)
         });
         threads.push(handle);
     }
@@ -111,11 +117,17 @@ pub fn test_concurrent(mut znstarget: ZNSTarget, n_threads: u8) -> Result<(), Bo
     for handle in threads {
         handle.join().unwrap();
     }
-    reclaim_thread.join().unwrap(); // I believe this will be problematic
+
+    println!("Joined threads");
+
+    znstarget.end_reclaim();
+    reclaim_thread.join().unwrap();
+
+    println!("Joined reclaim thread");
 
     let mut znstarget = Arc::try_unwrap(znstarget).unwrap_or_else(|_| panic!("This legit can't happen"));
 
-    znstarget.backing.get_zone_reports(1)?;
+    znstarget.backing.get_zone_reports(2)?;
 
     Ok(())
 }

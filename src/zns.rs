@@ -4,8 +4,8 @@
 #[derive(Debug, Clone, Copy)]
 #[allow(unused)]
 pub struct IdentifyNamespaceZNSData {
-    zoc : u16,             // zone operation characteristics 
-    ozcs : u16,            // optional zoned command support 
+    pub zoc : u16,             // zone operation characteristics 
+    pub ozcs : u16,            // optional zoned command support 
 	mar : u32,             // maximum active resources 
 	mor : u32,	           // maximum open resources  
 	rrl : u32,	           // reset recommended limit
