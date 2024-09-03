@@ -80,7 +80,9 @@ struct IdentifyNamespaceData {
     npdg: u16,
     npda: u16,
     nows: u16,
-    _rsvd1: [u8; 18],
+    pub mssrl: u16,
+    pub mcl: u32,
+    _rsvd1: [u8; 12],
     anagrpid: u32,
     _rsvd2: [u8; 3],
     nsattr: u8,
@@ -165,8 +167,8 @@ impl NvmeQueuePair {
         reqs
     }
 
-    pub fn append_io(&mut self, ns_id: u32, block_size: u64, data: &impl DmaSlice, zslba: u64) {
-
+    pub fn append_io(&mut self, ns_id: u32, block_size: u64, data: &impl DmaSlice, zslba: u64) -> usize {
+        let mut reqs = 0;
         for chunk in data.chunks(2 * 4096) {
             let blocks = (chunk.slice.len() as u64 + block_size - 1) / block_size;
 
@@ -191,9 +193,54 @@ impl NvmeQueuePair {
                 }
             } else {
                 eprintln!("queue full");
-                return;
+                return reqs;
             }
+            reqs += 1;
         }
+        reqs
+    }
+
+    // Warning: Not made for qd > 1, will complete immediately
+    // Takes a buffer, needs to have at least 4096 size.
+    pub fn copy(&mut self, ns_id: u32, mut src: u64, mut dest: u64, mut len: u64, buffer: &mut Dma<u8>) -> usize {
+        assert!(buffer.size >= 4096);
+        let mut reqs = 0;
+        while len > 0 {
+            let current_len = std::cmp::min(len, 128);
+            let data = buffer.virt as *mut SourceRangeEntriesDescriptorFormat0;
+            unsafe {
+                (*data).slba = src;
+                (*data).n_blocks = current_len as u16 - 1;
+                (*data)._reserved1 = 0;
+                (*data)._reserved2 = 0;
+                (*data).rest = [0; 4076];
+            }
+            let ptr0 = buffer.phys as u64;
+
+            let entry = NvmeCommand::copy(
+                self.id << 11 | self.sub_queue.tail as u16,
+                ns_id,
+                dest,
+                ptr0,
+            );
+
+            if let Some(tail) = self.sub_queue.submit_checked(entry) {
+                unsafe {
+                    std::ptr::write_volatile(self.sub_queue.doorbell as *mut u32, tail as u32);
+                }
+            } else {
+                eprintln!("queue full");
+                return reqs;
+            }
+
+            self.complete_io(1).unwrap(); // Kinda forced to do this cause submission queue possibly can't hold all copy requests
+
+            len -= current_len;
+            src += current_len;
+            dest += current_len;
+            reqs += 1;
+        }
+        reqs
     }
 
     pub fn zone_action(&mut self, ns_id: u32, zslba: u64, za: ZnsZsa) {
@@ -209,6 +256,7 @@ impl NvmeQueuePair {
             std::ptr::write_volatile(self.sub_queue.doorbell as *mut u32, tail as u32);
         }
     }
+
 
     // TODO: maybe return result
     pub fn complete_io(&mut self, n: usize) -> Option<u16> {
@@ -562,7 +610,9 @@ impl NvmeDevice {
 
         // TODO: check metadata?
         println!("Namespace {id}, Size: {size}, Blocks: {blocks}, Block size: {block_size}");
-
+        let mssrl = namespace_data.mssrl;
+        let mcl = namespace_data.mcl;
+        println!("Copy command mssrl {} and mcl {}", mssrl,mcl);
         let namespace = NvmeNamespace {
             id,
             blocks,
@@ -884,23 +934,30 @@ impl NvmeDevice {
         self.submit_and_complete_admin(|c_id, _| NvmeCommand::format_nvm(c_id, ns_id));
     }
 
-    pub fn copy(&mut self, ns_id: u32, src: u64, dest: u64, len: u64) -> Result<(), Box<dyn Error>> {
+    // TODO maybe use MCL instead of 128
+    pub fn copy(&mut self, ns_id: u32, mut src: u64, mut dest: u64, mut len: u64) -> Result<(), Box<dyn Error>> {
+        while len > 0 {
+            let current_len = std::cmp::min(len, 128);
+            let mut data = self.buffer.virt as *mut SourceRangeEntriesDescriptorFormat0;
+            unsafe {
+                (*data).slba = src;
+                (*data).n_blocks = current_len as u16 - 1;
+                //TODO is this necessary?
+                (*data)._reserved1 = 0;
+                (*data)._reserved2 = 0;
+                (*data).rest = [0; 4076];
+            }
+            let ptr0 = self.buffer.phys as u64;
 
-        let mut data = self.buffer.virt as *mut SourceRangeEntriesDescriptorFormat0;
-        unsafe {
-            (*data).slba = src;
-            (*data).n_blocks = len as u16;
-            //TODO is this necessary?
-            (*data)._reserved1 = 0;
-            (*data)._reserved2 = 0;
-            (*data).rest = [0; 4076];
+            let entry = NvmeCommand::copy(self.io_sq.tail as u16, ns_id, dest, ptr0);
+            let tail = self.io_sq.submit(entry);
+            self.write_reg_idx(NvmeArrayRegs::SQyTDBL, 1, tail as u32);
+            self.io_sq.head = self.complete_io(1).unwrap().sq_head as usize;
+
+            len -= current_len;
+            src += current_len;
+            dest += current_len;
         }
-        let ptr0 = self.buffer.phys as u64;
-
-        let entry = NvmeCommand::copy(self.io_sq.tail as u16, 1, dest, ptr0);
-        let tail = self.io_sq.submit(entry);
-        self.write_reg_idx(NvmeArrayRegs::SQyTDBL, 1, tail as u32);
-        self.io_sq.head = self.complete_io(1).unwrap().sq_head as usize;
 
         Ok(())
     }

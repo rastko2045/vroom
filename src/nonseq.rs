@@ -106,8 +106,6 @@ impl ZNSMap {
             let l_lba = self.d2l[d_old as usize];
             self.l2d[l_lba as usize] = d_new;
             self.d2l[d_new as usize] = l_lba;
-            self.invalid_bitmap[d_old as usize] = false;
-            self.invalid_bitmap[d_new as usize] = false;
             d_old += 1;
             d_new += 1;
         }
@@ -117,13 +115,25 @@ impl ZNSMap {
         self.invalid_bitmap[d_lba as usize]
     }
 
-    pub fn mark_invalid(&mut self, d_lba: u64) {
-        self.invalid_bitmap[d_lba as usize] = true;
+    // The mark_invalid functions need to work with LBAs, in case the physical blocks 
+    // that are mapped to the logical blocks are not contiguous
+    pub fn mark_invalid(&mut self, lba: u64) {
+        self.invalid_bitmap[self.l2d[lba as usize] as usize] = true;
     }
 
-    pub fn mark_invalid_len(&mut self, d_lba: u64, len: u64) {
+    pub fn mark_invalid_len(&mut self, lba: u64, len: u64) {
         for i in 0..len {
-            self.invalid_bitmap[(d_lba + i) as usize] = true;
+            self.invalid_bitmap[self.l2d[(lba + i) as usize] as usize] = true;
+        }
+    }
+
+    pub fn mark_valid(&mut self, d_lba: u64) {
+        self.invalid_bitmap[d_lba as usize] = false;
+    }
+
+    pub fn mark_valid_len(&mut self, d_lba: u64, len: u64) {
+        for i in 0..len {
+            self.invalid_bitmap[(d_lba + i) as usize] = false;
         }
     }
 
@@ -427,12 +437,13 @@ impl ZNSTarget {
 
             let mut map = self.map.lock().unwrap();
             if backing_block != ZNS_MAP_UNMAPPED {
-                map.mark_invalid_len(backing_block, length_contiguous);
-                let zone_number = self.get_zone_number(current_lba);
+                assert!(map.check_invalid(backing_block) == false);
+                map.mark_invalid_len(current_lba, length_contiguous);
+                let zone_number = self.get_zone_number(backing_block);
                 self.zones_metadata[zone_number].lock().unwrap().incr_invalid_blocks(length_contiguous);
                 assert!(map.count_mapped(current_lba, length_contiguous) == length_contiguous);
             }
-            map.update_len(current_lba, d_lba, length_contiguous as u64);
+            map.update_len(current_lba, d_lba, length_contiguous);
             drop(map);
 
             current_zone.incr_wp(length_contiguous)?;
@@ -444,9 +455,8 @@ impl ZNSTarget {
             current_array = &rest;
 
             if current_zone.is_full() {
-                let mut zones = self.zones.lock().unwrap();
-                zones.full_zones.push(current_zone);
-                self.reclaim_condition.notify_all();
+                self.zones.lock().unwrap().full_zones.push(current_zone);
+                self.reclaim()?;
             }
             else {
                 self.zones.lock().unwrap().free_zones.push(current_zone);
@@ -491,12 +501,12 @@ impl ZNSTarget {
 
             let mut map = self.map.lock().unwrap();
             if backing_block != ZNS_MAP_UNMAPPED {
-                map.mark_invalid_len(backing_block, length_contiguous);
-                let zone_number = self.get_zone_number(current_lba);
+                map.mark_invalid_len(current_lba, length_contiguous);
+                let zone_number = self.get_zone_number(backing_block);
                 self.zones_metadata[zone_number].lock().unwrap().incr_invalid_blocks(length_contiguous);
                 assert!(map.count_mapped(current_lba, length_contiguous) == length_contiguous);
             }
-            map.update_len(current_lba, d_lba, length_contiguous as u64);
+            map.update_len(current_lba, d_lba, length_contiguous);
             drop(map);
 
             current_zone.incr_wp(length_contiguous)?;
@@ -505,9 +515,8 @@ impl ZNSTarget {
             current_lba += length_contiguous;
 
             if current_zone.is_full() {
-                let mut zones = self.zones.lock().unwrap();
-                zones.full_zones.push(current_zone);
-                self.reclaim_condition.notify_all();
+                self.zones.lock().unwrap().full_zones.push(current_zone);
+                self.reclaim()?;
             }
             else {
                 self.zones.lock().unwrap().free_zones.push(current_zone);
@@ -534,7 +543,76 @@ impl ZNSTarget {
         }
     }
 
-    pub fn reclaim(&self, nvme_queue_pair: &mut NvmeQueuePair) -> Result<(), Box<dyn Error>> {
+    // This is needed in case the entire program is single threaded.
+    pub fn reclaim(&mut self) -> Result<(), Box<dyn Error>> {
+
+        let zones = self.zones.get_mut().unwrap();
+
+        if zones.free_zones.len() > zones.full_zones.len() {
+            return Ok(());
+        }
+
+        if zones.op_zones.is_empty() && zones.free_zones.is_empty() {
+            return Err("No free zones to reclaim to".into());
+        }
+
+        let mut op_zone = if zones.op_zones.is_empty() {
+            //TODO I should probably think about this means and when it can happen
+            eprintln!("No op zones, using free zone. I'm curious if this ever happens lol");
+            zones.free_zones.pop().unwrap()
+        } else {
+            zones.op_zones.pop().unwrap()
+        };
+
+        let mut victim = self.pick_victim()?;
+        let victim_zone_number = self.get_zone_number(victim.zslba);
+        let mut victim_metadata = self.zones_metadata[victim_zone_number].lock().unwrap();
+        
+        if victim_metadata.invalid_blocks == 0 {
+            return Ok(());
+        }
+
+        // Need to lock reads to the victim
+        let _lock = self.reclaim_locks[victim_zone_number].write().unwrap();
+
+        // Copy the valid data from the victim to the op zone
+        let mut victim_block = victim.zslba;
+        let mut remaining = victim.zslba + victim.zone_cap - victim_block;
+        while remaining > 0 {
+            let valid_len = self.map.lock().unwrap().lookup_contiguous_valid(victim_block, remaining);
+            if valid_len == 0 {
+                let invalid_len = self.map.lock().unwrap().lookup_contiguous_invalid(victim_block, remaining);
+                victim_block += invalid_len;
+            }
+            else {
+                // Append valid_len blocks from victim to op_zone and update wp
+                // Note: this is making the assumptions that all zones have the same capacity
+                self.backing.copy(self.ns_id, victim_block, op_zone.wp, valid_len)?;
+                self.map.lock().unwrap().remap(victim_block, op_zone.wp, valid_len);                
+                op_zone.incr_wp(valid_len)?;
+                victim_block += valid_len;
+            }
+            remaining = victim.zslba + victim.zone_cap - victim_block;
+        }
+
+        let mut map = self.map.lock().unwrap();
+        map.mark_valid_len(victim.zslba, victim.zone_cap);
+        map.mark_valid_len(op_zone.zslba, op_zone.zone_cap);
+        drop(map);
+        self.zones.lock().unwrap().free_zones.push(op_zone);
+        drop(_lock); // Remap is done, we can unlock the victim
+
+        // The victim block is now free and can be reset and added to the overprovisioning zones.
+        // and The overprovisioning zone can now be used as a free zone
+        self.backing.zone_action(self.ns_id, victim.zslba, false, ZnsZsa::ResetZone)?;
+        victim.reset();
+        victim_metadata.reset();
+        self.zones.lock().unwrap().op_zones.push(victim);
+        
+        Ok(())
+    }         
+
+    pub fn reclaim_concurrent(&self, nvme_queue_pair: &mut NvmeQueuePair, buffer: &mut Dma<u8>) -> Result<(), Box<dyn Error>> {
 
         let mut zones = self
             .reclaim_condition
@@ -564,9 +642,8 @@ impl ZNSTarget {
 
         let mut victim = self.pick_victim()?;
         let victim_zone_number = self.get_zone_number(victim.zslba);
-        let mut victim_metadata = self.zones_metadata[victim_zone_number].lock().unwrap();
         
-        if victim_metadata.invalid_blocks == 0 {
+        if self.zones_metadata[victim_zone_number].lock().unwrap().invalid_blocks == 0 {
             return Ok(());
         }
 
@@ -575,28 +652,28 @@ impl ZNSTarget {
 
         // Copy the valid data from the victim to the op zone
         let mut victim_block = victim.zslba;
-        while victim_block < victim.zslba + victim.zone_cap {
-            let valid_len = self.map.lock().unwrap().lookup_contiguous_valid(victim_block, victim.zone_cap);
+        let mut remaining = victim.zslba + victim.zone_cap - victim_block;
+        while remaining > 0 {
+            let valid_len = self.map.lock().unwrap().lookup_contiguous_valid(victim_block, remaining);
             if valid_len == 0 {
-                let invalid_len = self.map.lock().unwrap().lookup_contiguous_invalid(victim_block, victim.zone_cap);
+                let invalid_len = self.map.lock().unwrap().lookup_contiguous_invalid(victim_block, remaining);
                 victim_block += invalid_len;
             }
             else {
                 // Append valid_len blocks from victim to op_zone and update wp
                 // Note: this is making the assumptions that all zones have the same capacity
-                // TODO replace with copy
-                let mut data : Dma<u8> = Dma::allocate((valid_len * self.block_size) as usize)?;
-                nvme_queue_pair.submit_io(self.ns_id, self.block_size, &mut data, victim_block, false);
-                nvme_queue_pair.complete_io(1);
-                nvme_queue_pair.submit_io(self.ns_id, self.block_size, &mut data, op_zone.zslba, true);
-                nvme_queue_pair.complete_io(1);
-                assert!(op_zone.wp == op_zone.zslba);
+                nvme_queue_pair.copy(self.ns_id, victim_block, op_zone.wp, valid_len, buffer);
+                self.map.lock().unwrap().remap(victim_block, op_zone.wp, valid_len);                
                 op_zone.incr_wp(valid_len)?;
                 victim_block += valid_len;
             }
+            remaining = victim.zslba + victim.zone_cap - victim_block;
         }
 
-        self.map.lock().unwrap().remap(victim.zslba, op_zone.zslba, victim.zone_cap);
+        let mut map = self.map.lock().unwrap();
+        map.mark_valid_len(victim.zslba, victim.zone_cap);
+        map.mark_valid_len(op_zone.zslba, op_zone.zone_cap);
+        drop(map);
         self.zones.lock().unwrap().free_zones.push(op_zone);
         drop(_lock); // Remap is done, we can unlock the victim
 
@@ -605,7 +682,7 @@ impl ZNSTarget {
         nvme_queue_pair.zone_action(self.ns_id, victim.zslba, ZnsZsa::ResetZone);
         nvme_queue_pair.complete_io(1);
         victim.reset();
-        victim_metadata.reset();
+        self.zones_metadata[victim_zone_number].lock().unwrap().reset();
         self.zones.lock().unwrap().op_zones.push(victim);
         
         Ok(())
@@ -638,7 +715,7 @@ impl ZNSTarget {
                     
                     let split_index = Ord::min((length_contiguous * self.block_size) as usize, current_array.size);
         
-                    nvme_queue_pair.submit_io(self.ns_id, self.block_size,&current_array.slice(0..split_index), backing_block, false);
+                    nvme_queue_pair.submit_io(self.ns_id, self.block_size, &current_array.slice(0..split_index), backing_block, false);
 
                     rest = current_array.slice(split_index..current_array.size);
                     current_array = &rest;
@@ -655,14 +732,17 @@ impl ZNSTarget {
         Ok(())
     }
 
-    pub fn write_concurrent(&self, nvme_queue_pair: &mut NvmeQueuePair, data: &Dma<u8>, lba: u64) -> Result<(), Box<dyn Error>> {
+    // TODO I/O bigger than 8192 is not supported, unless prp_lists for DMA are implemented
+    pub fn write_concurrent(&self, nvme_queue_pair: &mut NvmeQueuePair, data: &Dma<u8>, lba: u64) -> Result<usize, Box<dyn Error>> {
 
         let mut blocks = (data.size as u64 + self.block_size - 1) / self.block_size;
         let mut current_lba = lba;
         let mut current_array = data;
         let mut rest;
 
-        if (lba + blocks as u64) > self.max_lba {
+        let mut reqs = 0;
+
+        if lba + blocks > self.max_lba {
             return Err("Write out of bounds".into());
         }
 
@@ -687,13 +767,14 @@ impl ZNSTarget {
 
             // Idea ignore d_lba and assume it's the write pointer, should always work out? Worth a try
             // Otherwise qd > 1 is gonna be impossible :(
-            nvme_queue_pair.append_io(self.ns_id, self.block_size, data, current_zone.zslba);
+            reqs += nvme_queue_pair.append_io(self.ns_id, self.block_size, &current_array.slice(0..split_index), current_zone.zslba);
 
             let mut map = self.map.lock().unwrap();
             let backing_block = map.lookup(current_lba);
             if backing_block != ZNS_MAP_UNMAPPED {
-                map.mark_invalid_len(backing_block, length_contiguous);
-                let zone_number = self.get_zone_number(current_lba);
+                assert!(map.check_invalid(backing_block) == false);
+                map.mark_invalid_len(current_lba, length_contiguous);
+                let zone_number = self.get_zone_number(backing_block);
                 self.zones_metadata[zone_number].lock().unwrap().incr_invalid_blocks(length_contiguous);
                 assert!(map.count_mapped(current_lba, length_contiguous) == length_contiguous);
             }
@@ -717,10 +798,10 @@ impl ZNSTarget {
                 }         
             }
             
-        Ok(())
+        Ok(reqs)
     }
 
-    pub fn end_reclaim(&self) {
+    pub fn stop_reclaim(&self) {
         self.end_reclaim.store(true, std::sync::atomic::Ordering::Relaxed);
         self.reclaim_condition.notify_all();
     }

@@ -65,7 +65,7 @@ pub fn test_concurrent(mut znstarget: ZNSTarget, n_threads: u8) -> Result<(), Bo
 
     let mut queue_pairs = Vec::new();
 
-    for _ in 0..(n_threads + 1) {
+    for _ in 0..n_threads {
         let qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH)?;
         queue_pairs.push(qpair);
     }
@@ -74,18 +74,19 @@ pub fn test_concurrent(mut znstarget: ZNSTarget, n_threads: u8) -> Result<(), Bo
 
     let queue_pairs = Arc::new(Mutex::new(queue_pairs));
 
+    let mut reclaim_qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH)?;
+
     let znstarget = Arc::new(znstarget);
     let znstarget_reclaim = znstarget.clone();
-    let reclaim_queue_pairs = queue_pairs.clone();
     let reclaim_thread = std::thread::spawn(move || {
-        let mut reclaim_queues = reclaim_queue_pairs.lock().unwrap().pop().unwrap();
         loop {
+            let mut buffer : Dma<u8> = Dma::allocate(4096).unwrap();
             let condition = znstarget_reclaim.end_reclaim.load(std::sync::atomic::Ordering::Relaxed);
             println!("Condition is {}", condition);
             if condition {
                 break;
             }
-            let _ = znstarget_reclaim.reclaim(&mut reclaim_queues);
+            let _ = znstarget_reclaim.reclaim_concurrent(&mut reclaim_qpair, &mut buffer);
         }
     });
 
@@ -120,7 +121,7 @@ pub fn test_concurrent(mut znstarget: ZNSTarget, n_threads: u8) -> Result<(), Bo
 
     println!("Joined threads");
 
-    znstarget.end_reclaim();
+    znstarget.stop_reclaim();
     reclaim_thread.join().unwrap();
 
     println!("Joined reclaim thread");
