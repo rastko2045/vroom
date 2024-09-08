@@ -9,6 +9,7 @@ const NS : u32 = 1;
 
 // Note: Huge page size can hold 512 blocks assuming block size 4096
 
+// sudo NVME_ADDR="0000:00:04.0" RUST_BACKTRACE=1 cargo test --test nonseq_tests -- --nocapture --test-threads=1
 
 
 #[test]
@@ -36,7 +37,7 @@ fn simple_write_then_read() {
     let lba = rng.gen_range(0..(available_zones * zcap) - 10);
 
     znstarget.write(&write_buffer.slice(0..block_size * 3), lba as u64).unwrap();
-    znstarget.read(&read_buffer.slice(0..block_size * 3), lba as u64).unwrap();
+    znstarget.read(&mut read_buffer.slice(0..block_size * 3), lba as u64).unwrap();
     
 
     for a in read_buffer[0..block_size * 3].iter() {
@@ -285,8 +286,8 @@ fn concurrent_writer() {
             let a = &(0..8192).map(|_| i as u8).collect::<Vec<_>>()[..];
             write_buffer[0..8192].copy_from_slice(a);
             for _ in 0..3000 {
-                znstarget_write.write_concurrent(&mut writer_qpair,&write_buffer.slice(0..8192), 0).unwrap();
-                writer_qpair.complete_io(1);
+                let reqs = znstarget_write.write_concurrent(&mut writer_qpair,&write_buffer.slice(0..8192), 0).unwrap();
+                writer_qpair.complete_io(reqs);
             }
         }
         drop(znstarget_write);
@@ -300,8 +301,6 @@ fn concurrent_writer() {
     for a in read_buffer[0..8192].iter() {
         assert_eq!(*a, 'y' as u8);
     }
-
-    znstarget.backing.get_zone_reports(NS).unwrap();
 }
 
 #[test]
@@ -338,9 +337,9 @@ fn concurrent_writers_readers() {
             for i in 'a'..'z' {
                 let a = &(0..8192).map(|_| i as u8).collect::<Vec<_>>()[..];
                 write_buffer[0..8192].copy_from_slice(a);
-                for k in 0..1000 { // TODO spice it up through i * k * t, maybe ignore the t and see what happens
-                    znstarget_write.write_concurrent(&mut writer_qpair,&write_buffer.slice(0..8192), t * 100).unwrap();
-                    writer_qpair.complete_io(1);
+                for _ in 0..1000 {
+                    let reqs = znstarget_write.write_concurrent(&mut writer_qpair,&write_buffer.slice(0..8192), t * 100).unwrap();
+                    writer_qpair.complete_io(reqs).unwrap();
                 }
             }
             drop(znstarget_write);
@@ -361,8 +360,8 @@ fn concurrent_writers_readers() {
         let read_thread = std::thread::spawn(move || {
             let mut reader_qpair = queue_pairs.lock().unwrap().pop().unwrap();
             let read_buffer : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE).unwrap();
-                znstarget_read.read_concurrent(&mut reader_qpair, &read_buffer.slice(0..8192), t * 100).unwrap();
-                reader_qpair.complete_io(1);
+                let reqs = znstarget_read.read_concurrent(&mut reader_qpair, &read_buffer.slice(0..8192), t * 100).unwrap();
+                reader_qpair.complete_io(reqs).unwrap();
                 for a in read_buffer[0..8192].iter() {
                     assert_eq!(*a, 'y' as u8);
                 }
@@ -422,12 +421,12 @@ fn concurrent_reclaim_one_writer() {
             let a = &(0..8192).map(|_| i as u8).collect::<Vec<_>>()[..];
             write_buffer[0..8192].copy_from_slice(a);
             for _ in 0..3000 {
-                znstarget_write.write_concurrent(&mut writer_qpair,&write_buffer.slice(0..8192), 0).unwrap();
-                writer_qpair.complete_io(1);
+                let reqs = znstarget_write.write_concurrent(&mut writer_qpair,&write_buffer.slice(0..8192), 0).unwrap();
+                writer_qpair.complete_io(reqs).unwrap();
             }
             write_buffer[0..8192].copy_from_slice(b);
-            znstarget_write.write_concurrent(&mut writer_qpair,&write_buffer.slice(0..8192), 50000).unwrap();
-            writer_qpair.complete_io(1);
+            let reqs = znstarget_write.write_concurrent(&mut writer_qpair,&write_buffer.slice(0..8192), 50000).unwrap();
+            writer_qpair.complete_io(reqs).unwrap();
         }
         drop(znstarget_write);
     });
@@ -450,7 +449,106 @@ fn concurrent_reclaim_one_writer() {
     }
 }
 
-// TODO not a boss yet
+#[test]
+fn concurrent_reading_reclaimed_zone() {
+    let mut znstarget = init_zns_target(
+        &get_pci_addr(), 
+        NS, 
+        0.5, 
+        vroom::nonseq::VictimSelectionMethod::InvalidBlocks);
+
+    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    let zcap = znstarget.backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
+    let block_size = znstarget.backing.namespaces.get(&NS).unwrap().block_size as usize;
+    let zones = znstarget.backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
+
+    let available_zones = (zones as f32 * 0.5) as usize;
+
+    if available_zones / 2 - 1 < 1 {
+        return;
+    }
+
+    // Fill up the first zone with invalid data
+    let mut write_buffer : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE).unwrap();
+    let a = &(0..block_size).map(|_| 'a' as u8).collect::<Vec<_>>()[..];
+    write_buffer[0..block_size].copy_from_slice(a);
+    for _ in 0..zcap {
+        znstarget.write(&write_buffer.slice(0..block_size), 0).unwrap();
+    }
+
+    const N_THREADS : usize = 2;
+    let mut queue_pairs = Vec::new();
+
+
+    // Start reclaim thread, concurrent read first zone and fill up other zones with valid data
+    for _ in 0..N_THREADS {
+        let qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+        queue_pairs.push(qpair);
+    }
+
+    let mut threads = Vec::new();
+
+    let mut reclaim_qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+    let mut writer_qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+    
+    let znstarget = Arc::new(znstarget);
+
+    let znstarget_reclaim = znstarget.clone();
+
+    let reclaim_thread = std::thread::spawn(move || {
+        let mut buffer : Dma<u8> = Dma::allocate(4096).unwrap();
+        loop {
+            let condition = znstarget_reclaim.end_reclaim.load(std::sync::atomic::Ordering::Relaxed);
+            if condition {
+                break;
+            }
+            znstarget_reclaim.reclaim_concurrent(&mut reclaim_qpair, &mut buffer).unwrap();
+        }
+    });
+
+    let queue_pairs = Arc::new(Mutex::new(queue_pairs));
+
+    let znstarget_write = znstarget.clone();
+
+    let writer_thread = std::thread::spawn(move || {
+        let mut buffer : Dma<u8> = Dma::allocate(4096).unwrap();
+        let a = &(0..block_size).map(|_| 'a' as u8).collect::<Vec<_>>()[..];
+        buffer[0..4096].copy_from_slice(a);
+        for zone in 1..available_zones/2 {
+            for lba in 0..zcap {
+                let reqs = znstarget_write.write_concurrent(&mut writer_qpair, &buffer.slice(0..4096), (zone * zcap + lba) as u64).unwrap();
+                writer_qpair.complete_io(reqs).unwrap();
+            }
+        }
+    });
+
+    for _ in 0..N_THREADS {
+        let znstarget_read = Arc::clone(&znstarget);
+        let queue_pairs = Arc::clone(&queue_pairs);
+        let read_thread = std::thread::spawn(move || {
+            let mut reader_qpair = queue_pairs.lock().unwrap().pop().unwrap();
+            let read_buffer : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE).unwrap();
+            for _ in 0..500000 {
+                let reqs = znstarget_read.read_concurrent(&mut reader_qpair, &read_buffer.slice(0..4096), 0).unwrap();
+                reader_qpair.complete_io(reqs).unwrap();
+            }
+            for a in read_buffer[0..4096].iter() {
+                assert_eq!(*a, 'a' as u8);
+            }
+        });
+        threads.push(read_thread);
+    }
+
+    writer_thread.join().unwrap();
+
+    for thread in threads {
+        thread.join().unwrap();
+    }
+
+    znstarget.stop_reclaim();
+    reclaim_thread.join().unwrap();
+}
+
 #[test]
 fn concurrency_boss() {
     let mut znstarget = init_zns_target(
@@ -520,11 +618,12 @@ fn concurrency_boss() {
             for i in 'a'..'z' {
                 let a = &(0..8192).map(|_| i as u8).collect::<Vec<_>>()[..];
                 write_buffer[0..8192].copy_from_slice(a);
-                for k in 1..3000 { // TODO spice it up through i * k * t, maybe ignore the t and see what happens
+                for k in 1..3000 {
                     let reqs = znstarget_write.write_concurrent(&mut writer_qpair,&write_buffer.slice(0..8192), ((i as usize - 90) * k * t) as u64).unwrap();
                     writer_qpair.complete_io(reqs).unwrap();
                 }
             }
+            println!("Writer {} is finished", t);
             drop(znstarget_write);
         });
         threads.push(write_thread);
@@ -536,9 +635,12 @@ fn concurrency_boss() {
         let read_thread = std::thread::spawn(move || {
             let mut reader_qpair = queue_pairs.lock().unwrap().pop().unwrap();
             let read_buffer : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE).unwrap();
-            znstarget_read.read_concurrent(&mut reader_qpair, &read_buffer.slice(0..8192), (t * zcap) as u64).unwrap();
-            reader_qpair.complete_io(1);
+            for i in 1..50000 {
+                let reqs = znstarget_read.read_concurrent(&mut reader_qpair, &read_buffer.slice(0..8192), (t * zcap + i) as u64).unwrap();
+                reader_qpair.complete_io(reqs).unwrap();
+            }
             drop(znstarget_read);
+            println!("Reader {} is finished", t);
         });
         threads.push(read_thread);
     }

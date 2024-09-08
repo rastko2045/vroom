@@ -330,6 +330,12 @@ impl ZNSTarget {
         while blocks > 0 {
             let backing_block = self.map.lock().unwrap().lookup(current_lba);
             if backing_block == ZNS_MAP_UNMAPPED {
+                // let length_contiguous = self.map.lock().unwrap().lookup_contiguous_physical(current_lba, blocks)?;
+                // rest = current_array.slice((length_contiguous * self.block_size) as usize..current_array.size);
+                // current_array = &rest;
+                // blocks -= length_contiguous;
+                // current_lba += length_contiguous;
+                // continue;
                 return Err("Block not mapped".into());
             }
 
@@ -409,7 +415,7 @@ impl ZNSTarget {
         let mut current_array = data;
         let mut rest;
 
-        if (lba + blocks as u64) > self.max_lba {
+        if lba + blocks > self.max_lba {
             return Err("Write out of bounds".into());
         }
 
@@ -471,7 +477,7 @@ impl ZNSTarget {
         let mut current_lba = lba;
         let mut current_array = data;
 
-        if (lba + blocks as u64) > self.max_lba {
+        if lba + blocks > self.max_lba {
             return Err("Write out of bounds".into());
         }
 
@@ -501,6 +507,7 @@ impl ZNSTarget {
 
             let mut map = self.map.lock().unwrap();
             if backing_block != ZNS_MAP_UNMAPPED {
+                assert!(map.check_invalid(backing_block) == false);
                 map.mark_invalid_len(current_lba, length_contiguous);
                 let zone_number = self.get_zone_number(backing_block);
                 self.zones_metadata[zone_number].lock().unwrap().incr_invalid_blocks(length_contiguous);
@@ -688,12 +695,14 @@ impl ZNSTarget {
         Ok(())
     }        
 
-    pub fn read_concurrent(&self, nvme_queue_pair: &mut NvmeQueuePair, dest: &Dma<u8>, lba: u64) -> Result<(), Box<dyn Error>> {
+    pub fn read_concurrent(&self, nvme_queue_pair: &mut NvmeQueuePair, dest: &Dma<u8>, lba: u64) -> Result<usize, Box<dyn Error>> {
 
         let mut blocks = (dest.size as u64 + self.block_size - 1) / self.block_size;
         let mut current_lba = lba;
         let mut current_array = dest;
         let mut rest;
+
+        let mut reqs = 0;
 
         if(lba + blocks as u64) > self.max_lba {
             return Err("Read out of bounds".into());
@@ -715,7 +724,7 @@ impl ZNSTarget {
                     
                     let split_index = Ord::min((length_contiguous * self.block_size) as usize, current_array.size);
         
-                    nvme_queue_pair.submit_io(self.ns_id, self.block_size, &current_array.slice(0..split_index), backing_block, false);
+                    reqs += nvme_queue_pair.submit_io(self.ns_id, self.block_size, &current_array.slice(0..split_index), backing_block, false);
 
                     rest = current_array.slice(split_index..current_array.size);
                     current_array = &rest;
@@ -729,7 +738,7 @@ impl ZNSTarget {
             };
         }
 
-        Ok(())
+        Ok(reqs)
     }
 
     // TODO I/O bigger than 8192 is not supported, unless prp_lists for DMA are implemented
@@ -778,7 +787,7 @@ impl ZNSTarget {
                 self.zones_metadata[zone_number].lock().unwrap().incr_invalid_blocks(length_contiguous);
                 assert!(map.count_mapped(current_lba, length_contiguous) == length_contiguous);
             }
-            map.update_len(current_lba, current_zone.wp, length_contiguous as u64);
+            map.update_len(current_lba, current_zone.wp, length_contiguous);
             drop(map);
 
             current_zone.incr_wp(length_contiguous)?;
