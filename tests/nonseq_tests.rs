@@ -9,9 +9,6 @@ const NS : u32 = 1;
 
 // Note: Huge page size can hold 512 blocks assuming block size 4096
 
-// sudo NVME_ADDR="0000:00:04.0" RUST_BACKTRACE=1 cargo test --test nonseq_tests -- --nocapture --test-threads=1
-
-
 #[test]
 fn simple_write_then_read() {
     let mut znstarget = init_zns_target(
