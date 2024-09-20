@@ -17,14 +17,16 @@ fn simple_write_then_read() {
         0.3, 
         vroom::nonseq::VictimSelectionMethod::InvalidBlocks);
 
-    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    let backing = znstarget.backing.get_mut().unwrap();
+
+    backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
 
     let mut write_buffer : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE as usize).unwrap();
     let read_buffer : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE as usize).unwrap();
 
-    let zcap = znstarget.backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
-    let block_size = znstarget.backing.namespaces.get(&NS).unwrap().block_size as usize;
-    let zones = znstarget.backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
+    let zcap = backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
+    let block_size = backing.namespaces.get(&NS).unwrap().block_size as usize;
+    let zones = backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
     let available_zones = (zones as f32 * 0.7) as usize;
 
     let a = &(0..block_size * 3).map(|_| 'a' as u8).collect::<Vec<_>>()[..];
@@ -50,11 +52,13 @@ fn simple_write_then_read_copied() {
         0.3, 
         vroom::nonseq::VictimSelectionMethod::InvalidBlocks);
 
-    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    let backing = znstarget.backing.get_mut().unwrap();
 
-    let zcap = znstarget.backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
-    let block_size = znstarget.backing.namespaces.get(&NS).unwrap().block_size as usize;
-    let zones = znstarget.backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
+    backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+
+    let zcap = backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
+    let block_size = backing.namespaces.get(&NS).unwrap().block_size as usize;
+    let zones = backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
     let available_zones = (zones as f32 * 0.7) as usize;
     
     let a = vec!['a' as u8; block_size * 3];
@@ -79,14 +83,16 @@ fn simple_overwrite_then_read() {
         0.3, 
         vroom::nonseq::VictimSelectionMethod::InvalidBlocks);
 
-    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    let backing = znstarget.backing.get_mut().unwrap();
+
+    backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
 
     let mut write_buffer : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE as usize).unwrap();
     let read_buffer : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE as usize).unwrap();
 
-    let zcap = znstarget.backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
-    let block_size = znstarget.backing.namespaces.get(&NS).unwrap().block_size as usize;
-    let zones = znstarget.backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
+    let zcap = backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
+    let block_size = backing.namespaces.get(&NS).unwrap().block_size as usize;
+    let zones = backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
     let available_zones = (zones as f32 * 0.7) as usize;
 
     let a = &(0..block_size).map(|_| 'a' as u8).collect::<Vec<_>>()[..];
@@ -114,13 +120,15 @@ fn overwrite_partial() {
         0.3, 
         vroom::nonseq::VictimSelectionMethod::InvalidBlocks);
 
-    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    let backing = znstarget.backing.get_mut().unwrap();
+
+    backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
 
     let mut write_buffer_a : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE as usize).unwrap();
     let mut write_buffer_b : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE as usize).unwrap();
     let read_buffer : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE as usize).unwrap();
 
-    let block_size = znstarget.backing.namespaces.get(&NS).unwrap().block_size as usize;
+    let block_size = backing.namespaces.get(&NS).unwrap().block_size as usize;
 
     let a = &(0..block_size * 3).map(|_| 'a' as u8).collect::<Vec<_>>()[..];
     let b = &(0..block_size * 3).map(|_| 'b' as u8).collect::<Vec<_>>()[..];
@@ -148,13 +156,15 @@ fn cross_zone() {
         0.3, 
         vroom::nonseq::VictimSelectionMethod::InvalidBlocks);
 
-    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    let backing = znstarget.backing.get_mut().unwrap();
+
+    backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
 
     let mut write_buffer_a : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE as usize).unwrap();
     let read_buffer : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE as usize).unwrap();
 
-    let block_size = znstarget.backing.namespaces.get(&NS).unwrap().block_size as usize;
-    let zcap = znstarget.backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
+    let block_size = backing.namespaces.get(&NS).unwrap().block_size as usize;
+    let zcap = backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
 
     let a = &(0..block_size * 3).map(|_| 'a' as u8).collect::<Vec<_>>()[..];
     write_buffer_a[0..block_size * 3].copy_from_slice(a);
@@ -178,9 +188,11 @@ fn sequential_reclaim_one_writer() {
         0.3, 
         vroom::nonseq::VictimSelectionMethod::InvalidBlocks);
 
-    let zcap = znstarget.backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
-    let block_size = znstarget.backing.namespaces.get(&NS).unwrap().block_size as usize;
-    let zones = znstarget.backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
+    let backing = znstarget.backing.get_mut().unwrap();
+
+    let zcap = backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
+    let block_size = backing.namespaces.get(&NS).unwrap().block_size as usize;
+    let zones = backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
 
     let available_zones = (zones as f32 * 0.7) as usize;
 
@@ -188,7 +200,7 @@ fn sequential_reclaim_one_writer() {
         return;
     }
 
-    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
 
     let mut write_buffer : Dma<u8> = Dma::allocate(zcap * block_size).unwrap();
     let read_buffer : Dma<u8> = Dma::allocate(zcap * block_size).unwrap();
@@ -205,7 +217,9 @@ fn sequential_reclaim_one_writer() {
         assert_eq!(*a, 'y' as u8);
     }
 
-    let zone_descriptors = znstarget.backing.get_zone_descriptors(NS).unwrap();
+    let backing = znstarget.backing.get_mut().unwrap();
+
+    let zone_descriptors = backing.get_zone_descriptors(NS).unwrap();
     let mut count = 0;
     for zone_descriptor in zone_descriptors {
         if zone_descriptor.zslba != zone_descriptor.wp {
@@ -223,9 +237,11 @@ fn sequential_partial_reclaim() {
         0.6, 
         vroom::nonseq::VictimSelectionMethod::InvalidBlocks);
 
-    let zcap = znstarget.backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
-    let block_size = znstarget.backing.namespaces.get(&NS).unwrap().block_size as usize;
-    let zones = znstarget.backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
+    let backing = znstarget.backing.get_mut().unwrap();
+
+    let zcap = backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
+    let block_size = backing.namespaces.get(&NS).unwrap().block_size as usize;
+    let zones = backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
 
     let available_zones = (zones as f32 * 0.4) as usize;
 
@@ -233,7 +249,7 @@ fn sequential_partial_reclaim() {
         return;
     }
 
-    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
 
     let mut write_buffer : Dma<u8> = Dma::allocate(zcap * block_size).unwrap();
     let read_buffer : Dma<u8> = Dma::allocate(zcap * block_size).unwrap();
@@ -264,15 +280,16 @@ fn sequential_partial_reclaim() {
 
 #[test]
 fn concurrent_writer() {
-    let mut znstarget = init_zns_target(
+    let znstarget = init_zns_target(
         &get_pci_addr(), 
         NS, 
         0.3, 
         vroom::nonseq::VictimSelectionMethod::InvalidBlocks);
 
-    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
-
-    let mut writer_qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+    let mut backing = znstarget.backing.lock().unwrap();
+    backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    let mut writer_qpair = backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+    drop(backing);
     
     let znstarget = Arc::new(znstarget);
 
@@ -287,6 +304,7 @@ fn concurrent_writer() {
                 writer_qpair.complete_io(reqs);
             }
         }
+        znstarget_write.backing.lock().unwrap().delete_io_queue_pair(writer_qpair).unwrap();
         drop(znstarget_write);
     });
     
@@ -302,22 +320,25 @@ fn concurrent_writer() {
 
 #[test]
 fn concurrent_writers_readers() {
-    let mut znstarget = init_zns_target(
+    let znstarget = init_zns_target(
         &get_pci_addr(), 
         NS, 
         0.3, 
         vroom::nonseq::VictimSelectionMethod::InvalidBlocks);
 
-    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    let mut backing = znstarget.backing.lock().unwrap();
+    backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
 
     let mut queue_pairs = Vec::new();
 
     const N_THREADS : u64 = 4;
 
     for _ in 0..N_THREADS * 2 {
-        let qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+        let qpair = backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
         queue_pairs.push(qpair);
     }
+
+    drop(backing);
 
     let mut threads = Vec::new();
 
@@ -339,6 +360,7 @@ fn concurrent_writers_readers() {
                     writer_qpair.complete_io(reqs).unwrap();
                 }
             }
+            znstarget_write.backing.lock().unwrap().delete_io_queue_pair(writer_qpair).unwrap();
             drop(znstarget_write);
         });
         threads.push(write_thread);
@@ -362,6 +384,7 @@ fn concurrent_writers_readers() {
                 for a in read_buffer[0..8192].iter() {
                     assert_eq!(*a, 'y' as u8);
                 }
+                znstarget_read.backing.lock().unwrap().delete_io_queue_pair(reader_qpair).unwrap();
                 drop(znstarget_read);
         });
         threads.push(read_thread);
@@ -374,17 +397,18 @@ fn concurrent_writers_readers() {
 
 #[test]
 fn concurrent_reclaim_one_writer() {
-    let mut znstarget = init_zns_target(
+    let znstarget = init_zns_target(
         &get_pci_addr(), 
         NS, 
         0.3, 
         vroom::nonseq::VictimSelectionMethod::InvalidBlocks);
 
-    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    let mut backing = znstarget.backing.lock().unwrap();
+    backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
 
-    let zcap = znstarget.backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
-    let block_size = znstarget.backing.namespaces.get(&NS).unwrap().block_size as usize;
-    let zones = znstarget.backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
+    let zcap = backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
+    let block_size = backing.namespaces.get(&NS).unwrap().block_size as usize;
+    let zones = backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
 
     let available_zones = (zones as f32 * 0.7) as usize;
 
@@ -392,8 +416,10 @@ fn concurrent_reclaim_one_writer() {
         return;
     }
 
-    let mut reclaim_qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
-    let mut writer_qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+    let mut reclaim_qpair = backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+    let mut writer_qpair = backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+
+    drop(backing);
     
     let znstarget = Arc::new(znstarget);
 
@@ -408,6 +434,7 @@ fn concurrent_reclaim_one_writer() {
             }
             znstarget_reclaim.reclaim_concurrent(&mut reclaim_qpair, &mut buffer).unwrap();
         }
+        znstarget_reclaim.backing.lock().unwrap().delete_io_queue_pair(reclaim_qpair).unwrap();
     });
 
     let znstarget_write = znstarget.clone();
@@ -425,6 +452,7 @@ fn concurrent_reclaim_one_writer() {
             let reqs = znstarget_write.write_concurrent(&mut writer_qpair,&write_buffer.slice(0..8192), 50000).unwrap();
             writer_qpair.complete_io(reqs).unwrap();
         }
+        znstarget_write.backing.lock().unwrap().delete_io_queue_pair(writer_qpair).unwrap();
         drop(znstarget_write);
     });
 
@@ -454,16 +482,19 @@ fn concurrent_reading_reclaimed_zone() {
         0.5, 
         vroom::nonseq::VictimSelectionMethod::InvalidBlocks);
 
-    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
-    let zcap = znstarget.backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
-    let block_size = znstarget.backing.namespaces.get(&NS).unwrap().block_size as usize;
-    let zones = znstarget.backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
+    let mut backing = znstarget.backing.lock().unwrap();
+    backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    let zcap = backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
+    let block_size = backing.namespaces.get(&NS).unwrap().block_size as usize;
+    let zones = backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
+    drop(backing);
 
     let available_zones = (zones as f32 * 0.5) as usize;
 
     if available_zones / 2 - 1 < 1 {
         return;
     }
+
 
     // Fill up the first zone with invalid data
     let mut write_buffer : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE).unwrap();
@@ -476,17 +507,20 @@ fn concurrent_reading_reclaimed_zone() {
     const N_THREADS : usize = 2;
     let mut queue_pairs = Vec::new();
 
+    let mut backing = znstarget.backing.lock().unwrap();
 
     // Start reclaim thread, concurrent read first zone and fill up other zones with valid data
     for _ in 0..N_THREADS {
-        let qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+        let qpair = backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
         queue_pairs.push(qpair);
     }
 
     let mut threads = Vec::new();
 
-    let mut reclaim_qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
-    let mut writer_qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+    let mut reclaim_qpair = backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+    let mut writer_qpair = backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+
+    drop(backing);
     
     let znstarget = Arc::new(znstarget);
 
@@ -501,6 +535,7 @@ fn concurrent_reading_reclaimed_zone() {
             }
             znstarget_reclaim.reclaim_concurrent(&mut reclaim_qpair, &mut buffer).unwrap();
         }
+        znstarget_reclaim.backing.lock().unwrap().delete_io_queue_pair(reclaim_qpair).unwrap();
     });
 
     let queue_pairs = Arc::new(Mutex::new(queue_pairs));
@@ -517,6 +552,7 @@ fn concurrent_reading_reclaimed_zone() {
                 writer_qpair.complete_io(reqs).unwrap();
             }
         }
+        znstarget_write.backing.lock().unwrap().delete_io_queue_pair(writer_qpair).unwrap();
     });
 
     for _ in 0..N_THREADS {
@@ -532,6 +568,7 @@ fn concurrent_reading_reclaimed_zone() {
             for a in read_buffer[0..4096].iter() {
                 assert_eq!(*a, 'a' as u8);
             }
+            znstarget_read.backing.lock().unwrap().delete_io_queue_pair(reader_qpair).unwrap();
         });
         threads.push(read_thread);
     }
@@ -556,11 +593,12 @@ fn concurrency_boss() {
 
     const N_THREADS : usize = 4;
 
-    znstarget.backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
-
-    let zcap = znstarget.backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
-    let block_size = znstarget.backing.namespaces.get(&NS).unwrap().block_size as usize;
-    let zones = znstarget.backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
+    let mut backing = znstarget.backing.lock().unwrap();
+    backing.zone_action(NS, 0, true, vroom::ZnsZsa::ResetZone).unwrap();
+    let zcap = backing.get_zone_descriptors(NS).unwrap()[0].zcap as usize;
+    let block_size = backing.namespaces.get(&NS).unwrap().block_size as usize;
+    let zones = backing.namespaces.get(&NS).unwrap().zns_info.unwrap().n_zones;
+    drop(backing);
 
     let available_zones = (zones as f32 * 0.7) as usize;
 
@@ -579,16 +617,18 @@ fn concurrency_boss() {
     }
 
     let mut queue_pairs = Vec::new();
+    let mut backing = znstarget.backing.lock().unwrap();
 
     for _ in 0..N_THREADS * 2 {
-        let qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+        let qpair = backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
         queue_pairs.push(qpair);
     }
 
     let mut threads = Vec::new();
 
-    let mut reclaim_qpair = znstarget.backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
-    
+    let mut reclaim_qpair = backing.create_io_queue_pair(QUEUE_LENGTH).unwrap();
+
+    drop(backing);
     let znstarget = Arc::new(znstarget);
 
     let znstarget_reclaim = znstarget.clone();
@@ -602,6 +642,7 @@ fn concurrency_boss() {
             }
             znstarget_reclaim.reclaim_concurrent(&mut reclaim_qpair, &mut buffer).unwrap();
         }
+        znstarget_reclaim.backing.lock().unwrap().delete_io_queue_pair(reclaim_qpair).unwrap();
     });
 
     let queue_pairs = Arc::new(Mutex::new(queue_pairs));    
@@ -621,6 +662,7 @@ fn concurrency_boss() {
                 }
             }
             println!("Writer {} is finished", t);
+            znstarget_write.backing.lock().unwrap().delete_io_queue_pair(writer_qpair).unwrap();
             drop(znstarget_write);
         });
         threads.push(write_thread);
@@ -632,10 +674,11 @@ fn concurrency_boss() {
         let read_thread = std::thread::spawn(move || {
             let mut reader_qpair = queue_pairs.lock().unwrap().pop().unwrap();
             let read_buffer : Dma<u8> = Dma::allocate(HUGE_PAGE_SIZE).unwrap();
-            for i in 1..50000 {
+            for i in 1..10000 {
                 let reqs = znstarget_read.read_concurrent(&mut reader_qpair, &read_buffer.slice(0..8192), (t * zcap + i) as u64).unwrap();
                 reader_qpair.complete_io(reqs).unwrap();
             }
+            znstarget_read.backing.lock().unwrap().delete_io_queue_pair(reader_qpair).unwrap();
             drop(znstarget_read);
             println!("Reader {} is finished", t);
         });

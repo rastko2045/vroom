@@ -200,8 +200,6 @@ impl NvmeQueuePair {
         reqs
     }
 
-    // Warning: Not made for qd > 1, will complete immediately
-    // Takes a buffer, needs to have at least 4096 size.
     pub fn copy(&mut self, ns_id: u32, mut src: u64, mut dest: u64, mut len: u64, buffer: &mut Dma<u8>) -> usize {
         assert!(buffer.size >= 4096);
         let mut reqs = 0;
@@ -233,13 +231,12 @@ impl NvmeQueuePair {
                 return reqs;
             }
 
-            self.complete_io(1).unwrap(); // Kinda forced to do this cause submission queue possibly can't hold all copy requests
-
             len -= current_len;
             src += current_len;
             dest += current_len;
             reqs += 1;
         }
+
         reqs
     }
 
@@ -448,8 +445,7 @@ impl NvmeDevice {
             println!("ns_id: {n}");
             dev.identify_namespace(n);
         }
-        //TODO if ZNS are supported call identify namespace and store zone data? IdentifyNamespaceZNSData
-        // See step 8 page 125, you'll find the answer through identify (CNS 1Ch) and figure 290
+        
         if((dev.get_reg64(NvmeRegs64::CAP as u64) >> 37) & 0x40 != 0) {
             let zns_ns = dev.identify_zns_namespace_list(0);
             for n in zns_ns {
@@ -934,6 +930,7 @@ impl NvmeDevice {
         self.submit_and_complete_admin(|c_id, _| NvmeCommand::format_nvm(c_id, ns_id));
     }
 
+    // Unfortunately not supported by the WD ZNS SSD :(
     // TODO maybe use MCL instead of 128
     pub fn copy(&mut self, ns_id: u32, mut src: u64, mut dest: u64, mut len: u64) -> Result<(), Box<dyn Error>> {
         while len > 0 {

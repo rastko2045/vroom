@@ -40,7 +40,7 @@ pub struct ZoneDescriptorData {
 
 pub fn zonetype_to_string(ztype: u8) -> &'static str {
 	match ztype {
-		2 => "Sequential Write Required",
+		2 => "Seq. Write Required",
 		_ => "unknown"
 	}
 }
@@ -48,8 +48,8 @@ pub fn zonetype_to_string(ztype: u8) -> &'static str {
 pub fn zonestate_to_string(zstate: u8) -> &'static str {
 	match zstate {
 		1 => "Empty",
-		2 => "Implicitly Open",
-		3 => "Explicitly Open",
+		2 => "Imp. Open",
+		3 => "Exp. Open",
 		4 => "Closed",
 		13 => "Read Only",
 		14 => "Full",
